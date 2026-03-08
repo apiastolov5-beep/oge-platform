@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<script>
+// ╔══════════════════════════════════════════════════════╗
+// ║  Минимальный Supabase клиент — без CDN, чистый fetch ║
+// ║  Покрывает: auth + from().select/insert/update/delete║
+// ╚══════════════════════════════════════════════════════╝
+window.supabase = {
+  createClient: function(url, key) {
+    var base = url.replace(/\/$/, '');
+    var headers = { 'apikey': key, 'Content-Type': 'application/json' };
+
+    // ── Хранение сессии ──
+    var SESSION_KEY = 'sb_session';
+    var _session = null;
+    var _authListeners = [];
+
+    function saveSession(s) {
+      _session = s;
+      try { localStorage.setItem(SESSION_KEY, JSON.stringify(s)); } catch(e){}
+      _authListeners.forEach(function(fn){ fn('SIGNED_IN', s); });
+    }
+    function clearSession() {
+      _session = null;
+      try { localStorage.removeItem(SESSION_KEY); } catch(e){}
+      _authListeners.forEach(function(fn){ fn('SIGNED_OUT', null); });
+    }
+    function loadSession() {
+      if (_session) return _session;
+      try {
+        var raw = localStorage.getItem(SESSION_KEY);
+        if (raw) { _session = JSON.parse(raw); return _session; }
+      } catch(e){}
+      return null;
+    }
+
+    // ── AUTH ──
+    var auth = {
+      getSession: async function() {
+        var s = loadSession();
+        // Refresh if expired
+        if (s && s.expires_at && Date.now() / 1000 > s.expires_at - 60) {
+          try {
+            var r = await fetch(base + '/auth/v1/token?grant_type=refresh_token', {
+              method: 'POST',
+              headers: headers,
+              body: JSON.stringify({ refresh_token: s.refresh_token })
+            });
+            var d = await r.json();
+            if (d.access_token) {
+              s = { access_token: d.access_token, refresh_token: d.refresh_token,
+                    expires_at: Math.floor(Date.now()/1000) + (d.expires_in||3600), user: d.user };
+              saveSession(s);
+            } else { clearSession(); return { data: { session: null }, error: null }; }
+          } catch(e) { return { data: { session: loadSession() }, error: null }; }
+        }
+        return { data: { session: s }, error: null };
+      },
+
+      onAuthStateChange: function(callback) {
+        _authListeners.push(callback);
+        // Fire immediately with current state
+        var s = loadSession();
+        if (s) setTimeout(function(){ callback('SIGNED_IN', s); }, 0);
+        return { data: { subscription: { unsubscribe: function(){
+          _authListeners = _authListeners.filter(function(f){ return f !== callback; });
+        }}}};
+      },
+
+      signInWithPassword: async function(opts) {
+        try {
+          var r = await fetch(base + '/auth/v1/token?grant_type=password', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ email: opts.email, password: opts.password })
+          });
+          var d = await r.json();
+          if (d.error || d.error_description || d.msg) {
+            var msg = d.error_description || d.msg || d.error || 'Ошибка входа';
+            if (msg.includes('Invalid login')) msg = 'Invalid login credentials';
+            return { data: null, error: { message: msg } };
+          }
+          var s = { access_token: d.access_token, refresh_token: d.refresh_token,
+                    expires_at: Math.floor(Date.now()/1000) + (d.expires_in||3600), user: d.user };
+          saveSession(s);
+          return { data: { session: s, user: d.user }, error: null };
+        } catch(e) { return { data: null, error: { message: e.message } }; }
+      },
+
+      signUp: async function(opts) {
+        try {
+          var r = await fetch(base + '/auth/v1/signup', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ email: opts.email, password: opts.password,
+                                   data: (opts.options && opts.options.data) || {} })
+          });
+          var d = await r.json();
+          if (d.error || d.error_description) {
+            return { data: null, error: { message: d.error_description || d.error } };
+          }
+          // Auto-login after signup
+          var s = null;
+          if (d.access_token) {
+            s = { access_token: d.access_token, refresh_token: d.refresh_token,
+                  expires_at: Math.floor(Date.now()/1000) + (d.expires_in||3600), user: d.user };
+            saveSession(s);
+          }
+          return { data: { session: s, user: d.user || d }, error: null };
+        } catch(e) { return { data: null, error: { message: e.message } }; }
+      },
+
+      signOut: async function() {
+        var s = loadSession();
+        if (s) {
+          try {
+            await fetch(base + '/auth/v1/logout', {
+              method: 'POST',
+              headers: Object.assign({}, headers, { 'Authorization': 'Bearer ' + s.access_token })
+            });
+          } catch(e){}
+        }
+        clearSession();
+        return { error: null };
+      }
+    };
+
+    // ── DATABASE (PostgREST) ──
+    function from(table) {
+      var _filters = [];
+      var _select = '*';
+      var _order = null;
+      var _limit = null;
+
+      function getAuthHeader() {
+        var s = loadSession();
+        if (s && s.access_token) return { 'Authorization': 'Bearer ' + s.access_token };
+        return {};
+      }
+
+      function buildUrl() {
+        var u = base + '/rest/v1/' + table + '?select=' + _select;
+        _filters.forEach(function(f){ u += '&' + f; });
+        if (_order) u += '&order=' + _order;
+        if (_limit) u += '&limit=' + _limit;
+        return u;
+      }
+
+      var q = {
+        select: function(cols) { _select = cols || '*'; return q; },
+        eq:     function(col, val) { _filters.push(col + '=eq.' + encodeURIComponent(val)); return q; },
+        neq:    function(col, val) { _filters.push(col + '=neq.' + encodeURIComponent(val)); return q; },
+        or:     function(expr) { _filters.push('or=(' + expr + ')'); return q; },
+        order:  function(col, opts) {
+          _order = col + (opts && opts.ascending === false ? '.desc' : '.asc');
+          return q;
+        },
+        limit:  function(n) { _limit = n; return q; },
+
+        // Execute SELECT
+        then: function(resolve, reject) {
+          return fetch(buildUrl(), {
+            headers: Object.assign({}, headers, getAuthHeader(),
+                       { 'Prefer': 'return=representation' })
+          })
+          .then(function(r){ return r.json(); })
+          .then(function(d){
+            if (d && d.code && d.message) resolve({ data: null, error: { message: d.message } });
+            else resolve({ data: Array.isArray(d) ? d : [], error: null });
+          })
+          .catch(function(e){ resolve({ data: null, error: { message: e.message } }); });
+        },
+
+        insert: async function(rows) {
+          try {
+            var body = Array.isArray(rows) ? rows : [rows];
+            var r = await fetch(base + '/rest/v1/' + table, {
+              method: 'POST',
+              headers: Object.assign({}, headers, getAuthHeader(), { 'Prefer': 'return=representation' }),
+              body: JSON.stringify(body)
+            });
+            var d = await r.json();
+            if (d && d.code) return { data: null, error: { message: d.message || d.details } };
+            return { data: Array.isArray(d) ? d : [d], error: null };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        upsert: async function(rows) {
+          try {
+            var body = Array.isArray(rows) ? rows : [rows];
+            var r = await fetch(base + '/rest/v1/' + table, {
+              method: 'POST',
+              headers: Object.assign({}, headers, getAuthHeader(),
+                         { 'Prefer': 'return=representation,resolution=merge-duplicates' }),
+              body: JSON.stringify(body)
+            });
+            var d = await r.json();
+            if (d && d.code) return { data: null, error: { message: d.message } };
+            return { data: d, error: null };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        update: async function(vals) {
+          try {
+            var u = base + '/rest/v1/' + table + '?';
+            _filters.forEach(function(f, i){ u += (i?'&':'') + f; });
+            var r = await fetch(u, {
+              method: 'PATCH',
+              headers: Object.assign({}, headers, getAuthHeader(), { 'Prefer': 'return=representation' }),
+              body: JSON.stringify(vals)
+            });
+            var d = await r.json();
+            if (d && d.code) return { data: null, error: { message: d.message } };
+            return { data: d, error: null };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        delete: async function() {
+          try {
+            var u = base + '/rest/v1/' + table + '?';
+            _filters.forEach(function(f, i){ u += (i?'&':'') + f; });
+            var r = await fetch(u, {
+              method: 'DELETE',
+              headers: Object.assign({}, headers, getAuthHeader())
+            });
+            return { data: null, error: r.ok ? null : { message: 'Delete failed' } };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        filter: function(col, op, val) { _filters.push(col + '=' + op + '.' + encodeURIComponent(val)); return q; }
+      };
+      return q;
+    }
+
+    return { auth: auth, from: from };
+  }
+};
+
+</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ОГЭ Математика — Алексей Пястолов</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#080810">
+
+<style>
+:root{--bg:#080810;--s1:#0f0f1c;--s2:#181828;--s3:#22223a;--math:#00d4ff;--math2:#0088cc;--green:#00e5a0;--pink:#ff3377;--soc:#ffaa00;--text:#eeeef8;--muted:#5a5a88;--border:rgba(255,255,255,.07);--r:16px;}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Segoe UI','Arial',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
+body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");opacity:.5;}
+
+/* NAV */
+nav{position:sticky;top:0;z-index:300;display:flex;align-items:center;justify-content:space-between;padding:11px 28px;background:rgba(8,8,16,.95);backdrop-filter:blur(24px);border-bottom:1px solid var(--border);gap:12px;}
+.nav-logo{display:flex;align-items:center;gap:11px;text-decoration:none;flex-shrink:0;}
+.logo-mark{width:42px;height:42px;border-radius:13px;background:var(--s2);border:1.5px solid var(--border);display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;transition:transform .5s cubic-bezier(.34,1.56,.64,1),border-color .3s,box-shadow .3s;}
+.logo-mark::before{content:'';position:absolute;inset:-50%;width:200%;height:200%;background:conic-gradient(from 0deg,var(--math),var(--soc),var(--pink),var(--math));opacity:0;transition:opacity .35s;}
+.nav-logo:hover .logo-mark{transform:rotate(-10deg) scale(1.2);border-color:var(--math);box-shadow:0 0 0 4px rgba(0,212,255,.18),0 0 28px rgba(0,212,255,.35),0 0 50px rgba(255,170,0,.15);}
+.nav-logo:hover .logo-mark::before{opacity:.28;animation:logospin 3s linear infinite;}
+@keyframes logospin{to{transform:rotate(360deg);}}
+.logo-letters{position:relative;z-index:2;font-family:'Arial Black','Arial',sans-serif;font-size:14px;font-weight:900;display:flex;gap:1px;letter-spacing:-1px;transition:transform .5s cubic-bezier(.34,1.56,.64,1);}
+.nav-logo:hover .logo-letters{transform:scale(1.12);}
+.la{color:var(--math);}
+.lp{color:var(--soc);}
+.logo-text{display:flex;flex-direction:column;line-height:1.25;}
+.logo-main{font-family:'Arial Black','Arial',sans-serif;font-size:13px;font-weight:900;letter-spacing:-.5px;background:linear-gradient(135deg,var(--math),var(--soc));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.logo-sub{font-size:10px;color:var(--muted);}
+
+/* Nav section tabs — MATH only, no social link */
+.nav-tabs{display:flex;gap:4px;flex:1;justify-content:center;flex-wrap:wrap;}
+.ntab{padding:7px 13px;border-radius:999px;border:1px solid var(--border);background:transparent;color:var(--muted);font-family:'Segoe UI','Arial',sans-serif;font-size:12px;cursor:pointer;transition:all .2s;white-space:nowrap;}
+.ntab:hover{color:var(--text);}
+.ntab.on{background:rgba(0,212,255,.1);border-color:rgba(0,212,255,.3);color:var(--math);}
+
+/* Profile */
+.profile-btn{position:relative;width:36px;height:36px;border-radius:50%;background:var(--s2);border:1.5px solid var(--border);display:flex;align-items:center;justify-content:center;text-decoration:none;transition:transform .4s cubic-bezier(.34,1.56,.64,1),border-color .25s,box-shadow .25s;flex-shrink:0;}
+.profile-btn svg{width:16px;height:16px;fill:var(--muted);transition:fill .2s;}
+.profile-btn:hover{transform:scale(1.22);border-color:var(--math);box-shadow:0 0 0 4px rgba(0,212,255,.12),0 0 18px rgba(0,212,255,.2);}
+.profile-btn:hover svg{fill:var(--math);}
+.pdot{position:absolute;top:-1px;right:-1px;width:9px;height:9px;border-radius:50%;background:var(--green);border:2px solid var(--bg);opacity:0;transform:scale(0);transition:all .3s;}
+.pdot.on{opacity:1;transform:scale(1);}
+
+/* PAGES */
+.pg{max-width:1060px;margin:0 auto;padding:0 28px 80px;display:none;}
+.pg.on{display:block;}
+
+/* HERO */
+.hero-grid{display:grid;grid-template-columns:1.2fr 1fr;gap:48px;align-items:start;padding:50px 0 36px;}
+@media(max-width:700px){.hero-grid{grid-template-columns:1fr;gap:26px;padding:34px 0 24px;}}
+.hero-tag{display:inline-flex;align-items:center;gap:7px;padding:5px 13px;border-radius:999px;background:rgba(0,212,255,.09);border:1px solid rgba(0,212,255,.22);color:var(--math);font-size:11px;font-weight:600;margin-bottom:14px;}
+.tag-dot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pulse 2s infinite;}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1);}50%{opacity:.3;transform:scale(1.5);}}
+h1{font-family:'Arial Black','Arial',sans-serif;font-size:clamp(24px,3.5vw,48px);font-weight:900;line-height:1.07;letter-spacing:-2px;}
+/* IMPORTANT: gradient only on specific span, rest of text stays white */
+.hl{background:linear-gradient(135deg,var(--math),#66eeff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;display:inline;}
+.hero-sub{font-size:14px;color:rgba(238,238,248,.6);line-height:1.75;margin:11px 0 22px;max-width:420px;}
+.hero-btns{display:flex;gap:9px;flex-wrap:wrap;}
+.btn-main{padding:12px 22px;border-radius:999px;background:linear-gradient(135deg,var(--math),var(--math2));color:#000;font-family:'Segoe UI','Arial',sans-serif;font-size:13px;font-weight:700;border:none;cursor:pointer;transition:all .25s;}
+.btn-main:hover{transform:translateY(-2px);box-shadow:0 0 36px rgba(0,212,255,.35);}
+.btn-ghost{padding:12px 22px;border-radius:999px;background:transparent;color:var(--text);font-family:'Segoe UI','Arial',sans-serif;font-size:13px;border:1px solid var(--border);cursor:pointer;transition:all .2s;}
+.btn-ghost:hover{border-color:rgba(255,255,255,.2);}
+
+/* Auth gate */
+.auth-gate{display:none;margin-top:18px;padding:14px 16px;border-radius:12px;background:rgba(0,212,255,.05);border:1px solid rgba(0,212,255,.15);font-size:13px;color:var(--muted);}
+.auth-gate.show{display:block;}
+.auth-gate a{color:var(--math);text-decoration:none;font-weight:600;}
+.auth-gate a:hover{text-decoration:underline;}
+
+/* Progress ring */
+.prog-card{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:18px;display:flex;align-items:center;gap:16px;margin-top:16px;display:none;}
+.prog-card.show{display:flex;}
+.ring-wrap{position:relative;flex-shrink:0;}
+.ring-wrap svg{transform:rotate(-90deg);}
+.ring-bg{fill:none;stroke:var(--s2);stroke-width:8;}
+.ring-fill{fill:none;stroke:url(#rg);stroke-width:8;stroke-linecap:round;stroke-dasharray:283;stroke-dashoffset:283;transition:stroke-dashoffset 1.2s ease;}
+.ring-pct{font-family:'Arial Black','Arial',sans-serif;font-size:16px;font-weight:800;color:var(--math);}
+.ring-sub{font-size:9px;color:var(--muted);}
+.ring-inner{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;}
+
+/* Tutor card */
+.tutor-card{background:var(--s1);border:1px solid rgba(0,212,255,.15);border-radius:20px;padding:26px;position:relative;overflow:hidden;}
+.tutor-card::before{content:'';position:absolute;top:-80px;right:-60px;width:200px;height:200px;border-radius:50%;background:radial-gradient(circle,rgba(0,212,255,.1),transparent 70%);pointer-events:none;}
+.tutor-av{width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,var(--math),var(--math2));display:flex;align-items:center;justify-content:center;font-family:'Arial Black','Arial',sans-serif;font-size:18px;font-weight:900;color:#000;margin-bottom:11px;box-shadow:0 6px 20px rgba(0,212,255,.25);}
+.tutor-name{font-family:'Arial Black','Arial',sans-serif;font-size:14px;font-weight:800;margin-bottom:2px;}
+.tutor-role{font-size:12px;color:var(--math);margin-bottom:16px;}
+.facts{display:flex;flex-direction:column;gap:8px;}
+.fact{display:flex;align-items:flex-start;gap:9px;padding:9px 12px;border-radius:10px;background:var(--s2);border:1px solid var(--border);font-size:12px;line-height:1.5;}
+.fi{font-size:14px;flex-shrink:0;margin-top:1px;}
+.fact strong{color:var(--math);}
+
+/* Stats row */
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:36px;}
+@media(max-width:560px){.stats-row{grid-template-columns:1fr 1fr;}}
+.stat-c{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:15px;}
+.stat-n{font-family:'Arial Black','Arial',sans-serif;font-size:21px;font-weight:800;color:var(--math);}
+.stat-l{font-size:11px;color:var(--muted);margin-top:2px;}
+
+/* Section */
+.sec-t{font-family:'Arial Black','Arial',sans-serif;font-size:clamp(17px,2.5vw,24px);font-weight:800;letter-spacing:-1px;margin-bottom:4px;margin-top:36px;}
+.sec-s{color:var(--muted);font-size:13px;margin-bottom:20px;line-height:1.6;}
+
+/* Topics */
+.topics-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:11px;}
+.topic-c{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:18px;cursor:pointer;transition:all .25s;position:relative;overflow:hidden;}
+.topic-c::after{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--math),#66eeff);transform:scaleX(0);transform-origin:left;transition:transform .3s;}
+.topic-c:hover{border-color:rgba(0,212,255,.3);transform:translateY(-3px);}
+.topic-c:hover::after{transform:scaleX(1);}
+.t-icon{width:38px;height:38px;border-radius:10px;background:rgba(0,212,255,.1);display:flex;align-items:center;justify-content:center;font-size:17px;margin-bottom:9px;}
+.t-name{font-family:'Arial Black','Arial',sans-serif;font-size:11px;font-weight:700;margin-bottom:3px;color:var(--text);}
+.t-desc{font-size:11px;color:var(--muted);line-height:1.5;}
+
+/* Filter */
+.filter-row{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:16px;}
+.fb{padding:6px 12px;border-radius:999px;border:1px solid var(--border);background:transparent;color:var(--muted);font-family:'Segoe UI','Arial',sans-serif;font-size:12px;cursor:pointer;transition:all .2s;}
+.fb.on{background:rgba(0,212,255,.09);border-color:rgba(0,212,255,.35);color:var(--math);}
+
+/* Tasks */
+.tasks-grid{display:grid;gap:11px;}
+.task-c{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:19px;transition:border-color .2s;}
+.task-c:hover{border-color:rgba(0,212,255,.18);}
+.t-meta{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:9px;}
+.t-num{font-family:'Arial Black','Arial',sans-serif;font-size:10px;color:var(--math);font-weight:600;}
+.t-topic{font-size:10px;color:var(--muted);margin-top:2px;}
+.diff{padding:3px 9px;border-radius:999px;font-size:10px;font-weight:600;}
+.de{background:rgba(0,229,160,.1);color:var(--green);}
+.dm{background:rgba(0,212,255,.1);color:var(--math);}
+.dh{background:rgba(255,51,119,.1);color:var(--pink);}
+.task-q{font-size:14px;line-height:1.75;margin-bottom:13px;color:var(--text);}
+.opts-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+@media(max-width:480px){.opts-grid{grid-template-columns:1fr;}}
+.opt-b{padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--s2);color:var(--text);font-family:'Segoe UI','Arial',sans-serif;font-size:13px;cursor:pointer;text-align:left;transition:all .2s;}
+.opt-b:hover:not(:disabled){border-color:var(--math);background:rgba(0,212,255,.07);}
+.opt-b.ok{border-color:var(--green)!important;background:rgba(0,229,160,.1)!important;color:var(--green)!important;}
+.opt-b.no{border-color:var(--pink)!important;background:rgba(255,51,119,.1)!important;color:var(--pink)!important;}
+.inp-row{display:flex;gap:8px;}
+.t-inp{flex:1;padding:10px 12px;border-radius:10px;background:var(--s2);border:1px solid var(--border);color:var(--text);font-family:'Segoe UI','Arial',sans-serif;font-size:14px;outline:none;transition:border-color .2s;}
+.t-inp:focus{border-color:var(--math);}
+.t-inp.ok{border-color:var(--green)!important;}
+.t-inp.no{border-color:var(--pink)!important;}
+.chk-btn{padding:10px 16px;border-radius:10px;background:var(--math);color:#000;font-family:'Segoe UI','Arial',sans-serif;font-size:12px;font-weight:600;border:none;cursor:pointer;}
+.ext-wrap{display:flex;flex-direction:column;gap:8px;}
+.ext-wrap textarea{width:100%;padding:11px 13px;border-radius:10px;background:var(--s2);border:1px solid var(--border);color:var(--text);font-family:'Segoe UI','Arial',sans-serif;font-size:14px;outline:none;resize:vertical;min-height:85px;transition:border-color .2s;}
+.ext-wrap textarea:focus{border-color:var(--math);}
+.ext-send{padding:10px 17px;border-radius:10px;background:linear-gradient(135deg,var(--math),var(--math2));color:#000;font-family:'Segoe UI','Arial',sans-serif;font-size:12px;font-weight:600;border:none;cursor:pointer;align-self:flex-end;}
+.ans-box{margin-top:9px;padding:11px 13px;border-radius:10px;background:rgba(0,212,255,.06);border:1px solid rgba(0,212,255,.17);font-size:12px;line-height:1.7;display:none;color:var(--text);}
+.ans-box.on{display:block;}
+.sent-ok{margin-top:7px;padding:8px 12px;border-radius:10px;background:rgba(0,229,160,.1);border:1px solid rgba(0,229,160,.2);font-size:12px;color:var(--green);display:none;}
+.sent-ok.on{display:block;}
+
+/* HW */
+.hw-grid{display:grid;gap:10px;}
+.hw-c{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:15px;display:flex;align-items:center;gap:13px;}
+.hw-ico{width:40px;height:40px;border-radius:11px;background:rgba(0,212,255,.1);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;}
+.hw-body{flex:1;}
+.hw-t{font-weight:600;font-size:13px;margin-bottom:2px;color:var(--text);}
+.hw-m{font-size:11px;color:var(--muted);}
+.hw-st{padding:4px 10px;border-radius:999px;font-size:10px;font-weight:600;}
+.st-n{background:rgba(0,212,255,.1);color:var(--math);}
+.st-d{background:rgba(0,229,160,.1);color:var(--green);}
+
+/* Plan table */
+.plan-t{width:100%;border-collapse:collapse;border-radius:var(--r);overflow:hidden;}
+.plan-t th{background:var(--s2);padding:10px 15px;font-family:'Arial Black','Arial',sans-serif;font-size:9px;font-weight:700;color:var(--muted);text-align:left;letter-spacing:1px;text-transform:uppercase;}
+.plan-t td{padding:10px 15px;border-top:1px solid var(--border);font-size:12px;color:var(--text);}
+.plan-t tr:hover td{background:rgba(255,255,255,.02);}
+.ph1{padding:3px 9px;border-radius:999px;font-size:10px;font-weight:600;background:rgba(0,212,255,.1);color:var(--math);}
+.ph2{padding:3px 9px;border-radius:999px;font-size:10px;font-weight:600;background:rgba(0,229,160,.1);color:var(--green);}
+.ph3{padding:3px 9px;border-radius:999px;font-size:10px;font-weight:600;background:rgba(255,51,119,.1);color:var(--pink);}
+
+/* StatGrad */
+.sg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:11px;}
+.sg-c{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:17px;transition:all .25s;}
+.sg-c:hover{border-color:rgba(0,212,255,.25);transform:translateY(-3px);}
+.sg-lbl{padding:3px 9px;border-radius:999px;font-size:10px;font-weight:600;display:inline-block;margin-bottom:8px;}
+.sg-d{background:rgba(0,212,255,.1);color:var(--math);}
+.sg-t{background:rgba(0,229,160,.1);color:var(--green);}
+.sg-title{font-family:'Arial Black','Arial',sans-serif;font-size:12px;font-weight:700;margin-bottom:3px;color:var(--text);}
+.sg-meta{font-size:11px;color:var(--muted);margin-bottom:13px;}
+.sg-btns{display:flex;gap:7px;}
+.sg-open{flex:1;padding:8px;border-radius:9px;background:rgba(0,212,255,.09);border:1px solid rgba(0,212,255,.2);color:var(--math);font-family:'Segoe UI','Arial',sans-serif;font-size:11px;font-weight:600;cursor:pointer;transition:all .2s;}
+.sg-open:hover{background:rgba(0,212,255,.18);}
+.sg-link{padding:8px 11px;border-radius:9px;background:var(--s2);border:1px solid var(--border);color:var(--muted);font-size:11px;text-decoration:none;transition:all .2s;}
+.sg-link:hover{border-color:var(--math);color:var(--math);}
+
+/* PDF modal */
+.pdf-modal{position:fixed;inset:0;z-index:500;display:none;flex-direction:column;background:rgba(8,8,16,.97);backdrop-filter:blur(14px);}
+.pdf-modal.open{display:flex;}
+.pdf-mhd{display:flex;align-items:center;justify-content:space-between;padding:13px 20px;border-bottom:1px solid var(--border);background:var(--s1);}
+.pdf-mt{font-family:'Arial Black','Arial',sans-serif;font-size:13px;font-weight:700;color:var(--text);}
+.pdf-mx{width:30px;height:30px;border-radius:50%;background:var(--s2);border:1px solid var(--border);color:var(--text);cursor:pointer;font-size:13px;display:flex;align-items:center;justify-content:center;}
+.pdf-body{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;align-items:center;gap:13px;}
+.pdf-drop{width:100%;max-width:680px;background:var(--s1);border:2px dashed var(--border);border-radius:var(--r);padding:44px 28px;text-align:center;position:relative;}
+.pdf-drop input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;}
+.pdf-nav{display:flex;align-items:center;gap:11px;padding:8px 15px;background:var(--s1);border-radius:10px;border:1px solid var(--border);}
+.pdf-btn{padding:7px 13px;border-radius:8px;background:var(--s2);border:1px solid var(--border);color:var(--text);font-family:'Segoe UI','Arial',sans-serif;font-size:12px;cursor:pointer;transition:all .2s;}
+.pdf-btn:hover:not(:disabled){background:var(--math);color:#000;border-color:var(--math);}
+.pdf-btn:disabled{opacity:.4;cursor:default;}
+#pdfCanvas{width:100%;max-width:800px;border-radius:10px;box-shadow:0 14px 48px rgba(0,0,0,.6);}
+
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(16px);z-index:2000;padding:11px 20px;border-radius:11px;background:var(--s2);border:1px solid var(--border);font-size:13px;opacity:0;transition:all .3s;pointer-events:none;white-space:nowrap;}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+.toast.ok{border-color:rgba(0,229,160,.3);color:var(--green);}
+
+@media(max-width:480px){nav{padding:9px 12px;}.logo-text{display:none;}.pg{padding:0 12px 60px;}}
+</style>
+</head>
+<body>
+<nav>
+  <!-- LEFT: Logo linking to home -->
+  <a class="nav-logo" href="index.html">
+    <div class="logo-mark">
+      <div class="logo-letters"><span class="la">А</span><span class="lp">П</span></div>
+    </div>
+    <div class="logo-text">
+      <div class="logo-main">ОГЭ Платформа</div>
+      <div class="logo-sub">На главную</div>
+    </div>
+  </a>
+
+  <!-- CENTER: Section tabs for math page only -->
+  <div class="nav-tabs">
+    <button class="ntab on" onclick="sw('home',this)">Главная</button>
+    <button class="ntab"    onclick="sw('topics',this)">Темы</button>
+    <button class="ntab"    onclick="sw('tasks',this)">Задачи</button>
+    <button class="ntab"    onclick="sw('hw',this)">ДЗ</button>
+    <button class="ntab"    onclick="sw('plan',this)">План</button>
+    <button class="ntab"    onclick="sw('sg',this)">СтатГрад</button>
+  </div>
+
+  <!-- RIGHT: Profile -->
+  <a class="profile-btn" href="cabinet.html">
+    <div class="pdot" id="pdot"></div>
+    <svg viewBox="0 0 24 24"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/></svg>
+  </a>
+</nav>
+
+<!-- HOME -->
+<div class="pg on" id="pg-home">
+  <div class="hero-grid">
+    <div>
+      <div class="hero-tag"><span class="tag-dot"></span>ОГЭ 2025 — Математика</div>
+      <h1>Сдай ОГЭ<br>на <span class="hl">5 баллов</span><br>без стресса</h1>
+      <p class="hero-sub">Персональная подготовка с Алексеем Пястоловым. Объясняю на языке девятиклассника — задачи ФИПИ, разборы, прогресс.</p>
+      <div class="hero-btns">
+        <button class="btn-main" onclick="sw('tasks',null)">Начать решать →</button>
+        <button class="btn-ghost" onclick="sw('plan',null)">Смотреть план</button>
+      </div>
+
+      <!-- Auth gate — shown when NOT logged in -->
+      <div class="auth-gate show" id="authGate">
+        🔒 <a href="cabinet.html">Войдите</a>, чтобы отслеживать прогресс и получать домашние задания от Алексея
+      </div>
+
+      <!-- Progress ring — shown when logged in -->
+      <div class="prog-card" id="progCard">
+        <div class="ring-wrap">
+          <svg width="76" height="76" viewBox="0 0 100 100">
+            <defs><linearGradient id="rg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#00d4ff"/><stop offset="100%" stop-color="#ff3377"/></linearGradient></defs>
+            <circle class="ring-bg" cx="50" cy="50" r="45"/>
+            <circle class="ring-fill" id="ringFill" cx="50" cy="50" r="45"/>
+          </svg>
+          <div class="ring-inner"><div class="ring-pct" id="ringPct">0%</div><div class="ring-sub">пройдено</div></div>
+        </div>
+        <div>
+          <div style="font-size:13px;font-weight:600;margin-bottom:3px;">Мой прогресс</div>
+          <div style="font-size:12px;color:var(--muted);" id="progText">Загрузка...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tutor card -->
+    <div class="tutor-card">
+      <div class="tutor-av">АП</div>
+      <div class="tutor-name">Алексей Пястолов</div>
+      <div class="tutor-role">Преподаватель математики</div>
+      <div class="facts">
+        <div class="fact"><span class="fi">🏆</span>Закончил школу с <strong>красным аттестатом</strong></div>
+        <div class="fact"><span class="fi">🎓</span>Студент — объясняю <strong>на языке школьника</strong></div>
+        <div class="fact"><span class="fi">📐</span>Задания из <strong>реальных вариантов ФИПИ</strong></div>
+        <div class="fact"><span class="fi">💬</span>Пишу родителям после <strong>каждого занятия</strong></div>
+        <div class="fact"><span class="fi">🎯</span>Результат за 2 месяца — <strong>гарантия или возврат</strong></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat-c"><div class="stat-n">12</div><div class="stat-l">тем курса</div></div>
+    <div class="stat-c"><div class="stat-n">44+</div><div class="stat-l">задач</div></div>
+    <div class="stat-c"><div class="stat-n">95%</div><div class="stat-l">сдают 4–5</div></div>
+    <div class="stat-c"><div class="stat-n">14 нед</div><div class="stat-l">до результата</div></div>
+  </div>
+</div>
+
+<!-- TOPICS -->
+<div class="pg" id="pg-topics">
+  <div class="sec-t">Все темы ОГЭ</div>
+  <div class="sec-s">12 разделов — нажми на тему чтобы перейти к задачам</div>
+  <div class="topics-grid" id="topicsGrid"></div>
+</div>
+
+<!-- TASKS -->
+<div class="pg" id="pg-tasks">
+  <div class="sec-t">Задачи ОГЭ</div>
+  <div class="sec-s">Тестовые и развёрнутые — с мгновенной проверкой и разбором</div>
+  <div class="filter-row" id="filterRow"></div>
+  <div class="tasks-grid" id="tasksGrid"><div style="color:var(--muted);padding:20px 0;">⏳ Загрузка...</div></div>
+</div>
+
+<!-- HW -->
+<div class="pg" id="pg-hw">
+  <div class="sec-t">Домашние задания</div>
+  <div class="sec-s">Задания от Алексея — выполни до следующего урока</div>
+  <div class="hw-grid" id="hwGrid"></div>
+</div>
+
+<!-- PLAN -->
+<div class="pg" id="pg-plan">
+  <div class="sec-t">АП · 14-недельный план</div>
+  <div class="sec-s">Авторская система подготовки Алексея Пястолова</div>
+  <table class="plan-t">
+    <thead><tr><th>Этап</th><th>Недели</th><th>Темы</th><th>Цель</th></tr></thead>
+    <tbody id="planBody"></tbody>
+  </table>
+</div>
+
+<!-- STATGRAD -->
+<div class="pg" id="pg-sg">
+  <div class="sec-t">Варианты СтатГрад</div>
+  <div class="sec-s">Загружай PDF и решай прямо в браузере</div>
+  <div class="sg-grid" id="sgGrid"></div>
+</div>
+
+<!-- PDF MODAL -->
+<div class="pdf-modal" id="pdfModal">
+  <div class="pdf-mhd">
+    <div class="pdf-mt" id="pdfTitle">Вариант</div>
+    <button class="pdf-mx" onclick="closePdf()">✕</button>
+  </div>
+  <div class="pdf-body">
+    <div id="pdfDrop" class="pdf-drop">
+      <input type="file" accept=".pdf" onchange="loadPdf(event)">
+      <div style="font-size:34px;margin-bottom:11px;">📄</div>
+      <div style="font-family:'Arial Black','Arial',sans-serif;font-size:13px;font-weight:700;margin-bottom:7px;color:var(--text);">Загрузи PDF</div>
+      <div style="font-size:12px;color:var(--muted);">Скачай с <strong style="color:var(--math)">math100.ru</strong> или statgrad.ru → перетащи сюда</div>
+    </div>
+    <div id="pdfViewer" style="display:none;width:100%;max-width:800px;">
+      <div class="pdf-nav">
+        <button class="pdf-btn" id="prevBtn" onclick="changePage(-1)" disabled>← Назад</button>
+        <div style="flex:1;text-align:center;font-size:12px;color:var(--muted);" id="pageInfo">1 / 1</div>
+        <button class="pdf-btn" id="nextBtn" onclick="changePage(1)">Вперёд →</button>
+      </div>
+      <canvas id="pdfCanvas" style="margin-top:11px;"></canvas>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+
+<script>
+var _SB_URL = 'https://vumpkvjmkgdzleltvwks.supabase.co';
+var _SB_KEY = 'sb_publishable_rNoVZMRI6CkPJWOYgOEjgQ_V7nh1b2x';
+var supabase = window.supabase.createClient(_SB_URL, _SB_KEY);
+
+(async function() {
+// Auth state
+(async function(){
+var _s = await supabase.auth.getSession();
+var session = _s.data && _s.data.session ? _s.data.session : null; = await supabase.auth.getSession();
+if (session) {
+  document.getElementById('pdot').classList.add('on');
+  document.getElementById('authGate').classList.remove('show');
+  document.getElementById('progCard').classList.add('show');
+  loadProgress(session.user.id);
+}
+supabase.auth.onAuthStateChange((_,s) => {
+  document.getElementById('pdot').classList.toggle('on', !!s);
+  if (s) {
+    document.getElementById('authGate').classList.remove('show');
+    document.getElementById('progCard').classList.add('show');
+    loadProgress(s.user.id);
+  }
+});
+
+async function loadProgress(uid) {
+  const {data} = await supabase.from('submissions').select('id').eq('user_id',uid).eq('subject','math');
+  const n = data?.length||0, total=44, pct=Math.min(100,Math.round(n/total*100));
+  document.getElementById('ringPct').textContent = pct+'%';
+  document.getElementById('progText').textContent = n+' задач решено из '+total;
+  document.getElementById('ringFill').style.strokeDashoffset = 283-(283*pct/100);
+}
+
+// Tasks
+let allTasks = [];
+const SAMPLE=[
+  {id:'m1',topic:'Числа и вычисления',num:'Задание №1',diff:'easy',question:'Вычислите: 2³ · 5 − 3²',type:'input',answer:'31',explain:'2³=8, 3²=9. 8·5−9=40−9=<strong style="color:var(--math)">31</strong>'},
+  {id:'m2',topic:'Числа и вычисления',num:'Задание №2',diff:'easy',question:'Найдите: √144 + √25',type:'input',answer:'17',explain:'√144=12, √25=5. 12+5=<strong style="color:var(--math)">17</strong>'},
+  {id:'m3',topic:'Уравнения',num:'Задание №3',diff:'easy',question:'Решите: 3x − 7 = 14',type:'input',answer:'7',explain:'3x=21, x=<strong style="color:var(--math)">7</strong>'},
+  {id:'m4',topic:'Уравнения',num:'Задание №4',diff:'mid',question:'Решите: x² − 5x + 6 = 0',type:'test',options:['x=2 и x=3','x=−2 и x=−3','x=1 и x=6','x=−1'],answer:'x=2 и x=3',explain:'D=25−24=1. x=(5±1)/2 → x=3 и x=2'},
+  {id:'m5',topic:'Геометрия: треугольники',num:'Задание №5',diff:'easy',question:'Катеты прямоугольного треугольника равны 3 и 4. Найдите гипотенузу.',type:'input',answer:'5',explain:'c²=9+16=25 → c=<strong style="color:var(--math)">5</strong>'},
+  {id:'m6',topic:'Геометрия: треугольники',num:'Задание №6',diff:'mid',question:'Два угла треугольника равны 60° и 80°. Найдите третий угол.',type:'input',answer:'40',explain:'Сумма углов=180°. 180−60−80=<strong style="color:var(--math)">40°</strong>'},
+  {id:'m7',topic:'Статистика',num:'Задание №7',diff:'easy',question:'Найдите среднее арифметическое: 4, 7, 9, 10, 5',type:'input',answer:'7',explain:'(4+7+9+10+5)/5=35/5=<strong style="color:var(--math)">7</strong>'},
+  {id:'m8',topic:'Теория вероятностей',num:'Задание №8',diff:'easy',question:'В коробке 3 красных и 7 синих шаров. Найдите вероятность вытащить синий.',type:'input',answer:'0.7',explain:'P=7/10=<strong style="color:var(--math)">0,7</strong>'},
+  {id:'m9',topic:'Текстовые задачи',num:'Задание №9',diff:'easy',question:'Велосипедист ехал 2 часа со скоростью 20 км/ч. Найдите расстояние.',type:'input',answer:'40',explain:'S=v·t=20·2=<strong style="color:var(--math)">40 км</strong>'},
+  {id:'m10',topic:'Текстовые задачи',num:'Задание №10',diff:'mid',question:'Два поезда выехали навстречу со скоростями 60 и 80 км/ч. Расстояние 420 км. Через сколько часов встретятся?',type:'input',answer:'3',explain:'t=420/(60+80)=420/140=<strong style="color:var(--math)">3 ч</strong>'},
+  {id:'m11',topic:'Функции и графики',num:'Задание №11',diff:'mid',question:'При каком x функция y=x²−4 равна нулю?',type:'test',options:['x=2','x=±2','x=4','x=−4'],answer:'x=±2',explain:'x²=4 → x=±2'},
+  {id:'m12',topic:'Текстовые задачи',num:'Задание 29 (развёрнутый)',diff:'hard',question:'Цена товара снизилась на 20%, а затем выросла на 25%. Изменилась ли итоговая цена? Объясните.',type:'extended',answer:'Итоговая цена выросла: 0.8·1.25=1.0, т.е. вернулась к исходной. Правильный ответ: цена не изменилась.',explain:'0.8 × 1.25 = 1.00 — цена вернулась к начальной. Многие ошибочно считают что снижение на 20% и рост на 25% дают +5%.'},
+];
+
+async function loadTasks() {
+  const {data,error} = await supabase.from('tasks').select('*').eq('subject','math').order('created_at',{ascending:false});
+  allTasks = (error||!data?.length) ? SAMPLE : data;
+  buildFilters('Все'); renderTasks('Все');
+}
+loadTasks();
+
+function buildFilters(active) {
+  const fr=document.getElementById('filterRow'); fr.innerHTML='';
+  ['Все',...new Set(allTasks.map(t=>t.topic))].forEach(tp=>{
+    const b=document.createElement('button');
+    b.className='fb'+(tp===active?' on':'');
+    b.textContent=tp==='Все'?'Все темы':tp;
+    b.onclick=()=>{document.querySelectorAll('.fb').forEach(x=>x.classList.remove('on'));b.classList.add('on');renderTasks(tp);};
+    fr.appendChild(b);
+  });
+}
+
+function renderTasks(filter) {
+  const grid=document.getElementById('tasksGrid');
+  const list=filter==='Все'?allTasks:allTasks.filter(t=>t.topic===filter);
+  if(!list.length){grid.innerHTML='<div style="color:var(--muted);padding:20px 0;">Нет задач по этой теме</div>';return;}
+  grid.innerHTML=list.map(t=>{
+    const dc=t.diff==='easy'?'de':t.diff==='mid'?'dm':'dh';
+    const dl=t.diff==='easy'?'Лёгкое':t.diff==='mid'?'Среднее':'Сложное';
+    const opts=Array.isArray(t.options)?t.options:(typeof t.options==='string'?JSON.parse(t.options||'[]'):[]);
+    let inp='';
+    const esc=s=>(s||'').replace(/'/g,"\\'").replace(/"/g,'&quot;');
+    if(t.type==='test'){
+      inp=`<div class="opts-grid">${opts.map(o=>`<button class="opt-b" onclick="chkOpt(this,'${esc(o)}','${esc(t.answer)}','${t.id}')">${o}</button>`).join('')}</div>`;
+    } else if(t.type==='extended'){
+      inp=`<div class="ext-wrap"><textarea id="ext_${t.id}" placeholder="Развёрнутый ответ..."></textarea><button class="ext-send" onclick="sendExt('${t.id}','${esc(t.num||'Задание')}')">Отправить Алексею →</button><div class="sent-ok" id="sok_${t.id}">✓ Отправлено на проверку</div></div>`;
+    } else {
+      inp=`<div class="inp-row"><input class="t-inp" id="inp_${t.id}" placeholder="Ответ..." onkeydown="if(event.key==='Enter')chkInp('${t.id}','${esc(t.answer)}')"><button class="chk-btn" onclick="chkInp('${t.id}','${esc(t.answer)}')">Проверить</button></div>`;
+    }
+    return `<div class="task-c"><div class="t-meta"><div><div class="t-num">${t.num||'Задание'}</div><div class="t-topic">${t.topic||''}</div></div><span class="diff ${dc}">${dl}</span></div><div class="task-q">${t.question||''}</div>${inp}<div class="ans-box" id="ans_${t.id}">💡 <strong>Разбор:</strong> ${t.explain||t.answer||''}</div></div>`;
+  }).join('');
+}
+})();
+
+window.chkOpt=function(btn,val,answer,id){btn.closest('.opts-grid').querySelectorAll('.opt-b').forEach(b=>{b.classList.remove('ok','no');b.disabled=true;});btn.classList.add(val===answer?'ok':'no');if(val!==answer)btn.closest('.opts-grid').querySelectorAll('.opt-b').forEach(b=>{if(b.textContent===answer)b.classList.add('ok');});document.getElementById('ans_'+id).classList.add('on');};
+window.chkInp=function(id,answer){const i=document.getElementById('inp_'+id);i.classList.remove('ok','no');i.classList.add(i.value.trim().replace(',','.')===answer.replace(',','.')?'ok':'no');document.getElementById('ans_'+id).classList.add('on');};
+window.sendExt=async function(id,num){const{data:{session}}=await supabase.auth.getSession();const text=document.getElementById('ext_'+id)?.value?.trim();if(!text)return;if(session)await supabase.from('submissions').insert({task_id:id,task_num:num,subject:'math',answer:text,user_id:session.user.id,user_name:session.user.user_metadata?.name||session.user.email,checked:false});document.getElementById('sok_'+id).classList.add('on');document.getElementById('ans_'+id).classList.add('on');};
+
+// HW
+async function loadHw(){
+  const el=document.getElementById('hwGrid');
+  const{data,error}=await supabase.from('homework').select('*').eq('subject','math').order('created_at',{ascending:false});
+  if(error||!data?.length){el.innerHTML=`<div class="hw-c"><div class="hw-ico">📐</div><div class="hw-body"><div class="hw-t">Уравнения — вариант №3</div><div class="hw-m">Задания 1–10 · Срок: завтра</div></div><span class="hw-st st-n">Новое</span></div><div class="hw-c"><div class="hw-ico">📐</div><div class="hw-body"><div class="hw-t">Геометрия: треугольники</div><div class="hw-m">Задания 15–20 · Срок: пятница</div></div><span class="hw-st st-n">Новое</span></div>`;return;}
+  el.innerHTML=data.map(h=>`<div class="hw-c"><div class="hw-ico">📝</div><div class="hw-body"><div class="hw-t">${h.title}</div><div class="hw-m">${h.description||''} ${h.deadline?'· Срок: '+new Date(h.deadline).toLocaleString('ru-RU',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}):''}</div></div><span class="hw-st st-n">Новое</span></div>`).join('');
+}
+loadHw();
+
+// Topics
+const TOPICS=[{i:'🔢',n:'Числа и вычисления',d:'Степени, корни, модуль'},{i:'📊',n:'Алгебраические выражения',d:'ФСУ, разложение'},{i:'⚖️',n:'Уравнения',d:'Линейные, квадратные'},{i:'📉',n:'Неравенства',d:'Линейные, системы'},{i:'📈',n:'Функции и графики',d:'Квадратичная, гипербола'},{i:'📐',n:'Геометрия: треугольники',d:'Пифагор, площадь'},{i:'⭕',n:'Геометрия: окружность',d:'Вписанные углы, хорды'},{i:'🔷',n:'Четырёхугольники',d:'Параллелограмм, трапеция'},{i:'📊',n:'Статистика',d:'Среднее, медиана, мода'},{i:'🎲',n:'Теория вероятностей',d:'Классическая вероятность'},{i:'📏',n:'Координатная геометрия',d:'Расстояние, середина'},{i:'💯',n:'Текстовые задачи',d:'Движение, работа, проценты'}];
+document.getElementById('topicsGrid').innerHTML=TOPICS.map(t=>`<div class="topic-c" onclick="filterTopic('${t.n}')"><div class="t-icon">${t.i}</div><div class="t-name">${t.n}</div><div class="t-desc">${t.d}</div></div>`).join('');
+window.filterTopic=n=>{sw('tasks',null);buildFilters(n);renderTasks(n);};
+
+// Plan
+const PLAN=[{ph:'ph1',w:'1–2',tp:'Числа, дроби, проценты',g:'Убрать базовые пробелы'},{ph:'ph1',w:'3–4',tp:'Алгебра: выражения, уравнения',g:'Уверенно решать часть 1'},{ph:'ph2',w:'5–6',tp:'Неравенства, функции',g:'Понимать задания 11–15'},{ph:'ph2',w:'7–8',tp:'Геометрия: треугольники, окружность',g:'Не бояться геометрии'},{ph:'ph2',w:'9–10',tp:'Статистика и вероятность',g:'Закрыть лёгкие 2 балла'},{ph:'ph3',w:'11–12',tp:'Текстовые задачи, часть 2',g:'Писать полные решения'},{ph:'ph3',w:'13–14',tp:'Варианты СтатГрад целиком',g:'Скорость + уверенность = 5'}];
+document.getElementById('planBody').innerHTML=PLAN.map(p=>`<tr><td><span class="${p.ph}">${p.ph==='ph1'?'Этап 1':p.ph==='ph2'?'Этап 2':'Этап 3'}</span></td><td style="color:var(--muted)">${p.w}</td><td>${p.tp}</td><td style="color:var(--math)">${p.g}</td></tr>`).join('');
+
+// StatGrad
+const SG=[{type:'diag',title:'Диагностическая работа №1',meta:'2024 · 25 заданий'},{type:'train',title:'Тренировочный вариант №1',meta:'2024 · с критериями'},{type:'diag',title:'Диагностическая работа №2',meta:'2024 · повышенная сложность'},{type:'train',title:'Тренировочный вариант №2',meta:'2024 · полный формат'}];
+document.getElementById('sgGrid').innerHTML=SG.map(v=>`<div class="sg-c"><span class="sg-lbl ${v.type==='diag'?'sg-d':'sg-t'}">${v.type==='diag'?'Диагностическая':'Тренировочный'}</span><div class="sg-title">${v.title}</div><div class="sg-meta">${v.meta}</div><div class="sg-btns"><button class="sg-open" onclick="openPdf('${v.title}')">📄 Открыть PDF</button><a href="https://math100.ru" target="_blank" class="sg-link">↗</a></div></div>`).join('');
+</script>
+</script>
+
+<script>
+window.sw=function(id,btn){document.querySelectorAll('.pg').forEach(p=>p.classList.remove('on'));document.getElementById('pg-'+id).classList.add('on');document.querySelectorAll('.ntab').forEach(b=>b.classList.remove('on'));if(btn)btn.classList.add('on');};
+
+// PDF
+// PDF viewer disabled
+let pdfDoc=null,pn=1;
+window.openPdf=function(t){document.getElementById('pdfTitle').textContent=t;document.getElementById('pdfModal').classList.add('open');document.getElementById('pdfDrop').style.display='block';document.getElementById('pdfViewer').style.display='none';};
+window.closePdf=function(){document.getElementById('pdfModal').classList.remove('open');};
+window.loadPdf=async function(e){const f=e.target.files[0];if(!f||typeof pdfjsLib==='undefined')return;const r=new FileReader();r.onload=async ev=>{pdfDoc=await pdfjsLib.getDocument({data:ev.target.result}).promise;document.getElementById('pdfDrop').style.display='none';document.getElementById('pdfViewer').style.display='block';pn=1;renderPg(1);};r.readAsArrayBuffer(f);};
+async function renderPg(n){if(!pdfDoc)return;const page=await pdfDoc.getPage(n);const vp=page.getViewport({scale:window.innerWidth>800?1.8:1.2});const c=document.getElementById('pdfCanvas');c.height=vp.height;c.width=vp.width;await page.render({canvasContext:c.getContext('2d'),viewport:vp}).promise;document.getElementById('pageInfo').textContent=`${n} / ${pdfDoc.numPages}`;document.getElementById('prevBtn').disabled=n<=1;document.getElementById('nextBtn').disabled=n>=pdfDoc.numPages;}
+window.changePage=function(d){if(!pdfDoc)return;const n=pn+d;if(n<1||n>pdfDoc.numPages)return;pn=n;renderPg(n);};
+
+</script>
+</body>
+</html>

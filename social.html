@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<script>
+// ╔══════════════════════════════════════════════════════╗
+// ║  Минимальный Supabase клиент — без CDN, чистый fetch ║
+// ║  Покрывает: auth + from().select/insert/update/delete║
+// ╚══════════════════════════════════════════════════════╝
+window.supabase = {
+  createClient: function(url, key) {
+    var base = url.replace(/\/$/, '');
+    var headers = { 'apikey': key, 'Content-Type': 'application/json' };
+
+    // ── Хранение сессии ──
+    var SESSION_KEY = 'sb_session';
+    var _session = null;
+    var _authListeners = [];
+
+    function saveSession(s) {
+      _session = s;
+      try { localStorage.setItem(SESSION_KEY, JSON.stringify(s)); } catch(e){}
+      _authListeners.forEach(function(fn){ fn('SIGNED_IN', s); });
+    }
+    function clearSession() {
+      _session = null;
+      try { localStorage.removeItem(SESSION_KEY); } catch(e){}
+      _authListeners.forEach(function(fn){ fn('SIGNED_OUT', null); });
+    }
+    function loadSession() {
+      if (_session) return _session;
+      try {
+        var raw = localStorage.getItem(SESSION_KEY);
+        if (raw) { _session = JSON.parse(raw); return _session; }
+      } catch(e){}
+      return null;
+    }
+
+    // ── AUTH ──
+    var auth = {
+      getSession: async function() {
+        var s = loadSession();
+        // Refresh if expired
+        if (s && s.expires_at && Date.now() / 1000 > s.expires_at - 60) {
+          try {
+            var r = await fetch(base + '/auth/v1/token?grant_type=refresh_token', {
+              method: 'POST',
+              headers: headers,
+              body: JSON.stringify({ refresh_token: s.refresh_token })
+            });
+            var d = await r.json();
+            if (d.access_token) {
+              s = { access_token: d.access_token, refresh_token: d.refresh_token,
+                    expires_at: Math.floor(Date.now()/1000) + (d.expires_in||3600), user: d.user };
+              saveSession(s);
+            } else { clearSession(); return { data: { session: null }, error: null }; }
+          } catch(e) { return { data: { session: loadSession() }, error: null }; }
+        }
+        return { data: { session: s }, error: null };
+      },
+
+      onAuthStateChange: function(callback) {
+        _authListeners.push(callback);
+        // Fire immediately with current state
+        var s = loadSession();
+        if (s) setTimeout(function(){ callback('SIGNED_IN', s); }, 0);
+        return { data: { subscription: { unsubscribe: function(){
+          _authListeners = _authListeners.filter(function(f){ return f !== callback; });
+        }}}};
+      },
+
+      signInWithPassword: async function(opts) {
+        try {
+          var r = await fetch(base + '/auth/v1/token?grant_type=password', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ email: opts.email, password: opts.password })
+          });
+          var d = await r.json();
+          if (d.error || d.error_description || d.msg) {
+            var msg = d.error_description || d.msg || d.error || 'Ошибка входа';
+            if (msg.includes('Invalid login')) msg = 'Invalid login credentials';
+            return { data: null, error: { message: msg } };
+          }
+          var s = { access_token: d.access_token, refresh_token: d.refresh_token,
+                    expires_at: Math.floor(Date.now()/1000) + (d.expires_in||3600), user: d.user };
+          saveSession(s);
+          return { data: { session: s, user: d.user }, error: null };
+        } catch(e) { return { data: null, error: { message: e.message } }; }
+      },
+
+      signUp: async function(opts) {
+        try {
+          var r = await fetch(base + '/auth/v1/signup', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ email: opts.email, password: opts.password,
+                                   data: (opts.options && opts.options.data) || {} })
+          });
+          var d = await r.json();
+          if (d.error || d.error_description) {
+            return { data: null, error: { message: d.error_description || d.error } };
+          }
+          // Auto-login after signup
+          var s = null;
+          if (d.access_token) {
+            s = { access_token: d.access_token, refresh_token: d.refresh_token,
+                  expires_at: Math.floor(Date.now()/1000) + (d.expires_in||3600), user: d.user };
+            saveSession(s);
+          }
+          return { data: { session: s, user: d.user || d }, error: null };
+        } catch(e) { return { data: null, error: { message: e.message } }; }
+      },
+
+      signOut: async function() {
+        var s = loadSession();
+        if (s) {
+          try {
+            await fetch(base + '/auth/v1/logout', {
+              method: 'POST',
+              headers: Object.assign({}, headers, { 'Authorization': 'Bearer ' + s.access_token })
+            });
+          } catch(e){}
+        }
+        clearSession();
+        return { error: null };
+      }
+    };
+
+    // ── DATABASE (PostgREST) ──
+    function from(table) {
+      var _filters = [];
+      var _select = '*';
+      var _order = null;
+      var _limit = null;
+
+      function getAuthHeader() {
+        var s = loadSession();
+        if (s && s.access_token) return { 'Authorization': 'Bearer ' + s.access_token };
+        return {};
+      }
+
+      function buildUrl() {
+        var u = base + '/rest/v1/' + table + '?select=' + _select;
+        _filters.forEach(function(f){ u += '&' + f; });
+        if (_order) u += '&order=' + _order;
+        if (_limit) u += '&limit=' + _limit;
+        return u;
+      }
+
+      var q = {
+        select: function(cols) { _select = cols || '*'; return q; },
+        eq:     function(col, val) { _filters.push(col + '=eq.' + encodeURIComponent(val)); return q; },
+        neq:    function(col, val) { _filters.push(col + '=neq.' + encodeURIComponent(val)); return q; },
+        or:     function(expr) { _filters.push('or=(' + expr + ')'); return q; },
+        order:  function(col, opts) {
+          _order = col + (opts && opts.ascending === false ? '.desc' : '.asc');
+          return q;
+        },
+        limit:  function(n) { _limit = n; return q; },
+
+        // Execute SELECT
+        then: function(resolve, reject) {
+          return fetch(buildUrl(), {
+            headers: Object.assign({}, headers, getAuthHeader(),
+                       { 'Prefer': 'return=representation' })
+          })
+          .then(function(r){ return r.json(); })
+          .then(function(d){
+            if (d && d.code && d.message) resolve({ data: null, error: { message: d.message } });
+            else resolve({ data: Array.isArray(d) ? d : [], error: null });
+          })
+          .catch(function(e){ resolve({ data: null, error: { message: e.message } }); });
+        },
+
+        insert: async function(rows) {
+          try {
+            var body = Array.isArray(rows) ? rows : [rows];
+            var r = await fetch(base + '/rest/v1/' + table, {
+              method: 'POST',
+              headers: Object.assign({}, headers, getAuthHeader(), { 'Prefer': 'return=representation' }),
+              body: JSON.stringify(body)
+            });
+            var d = await r.json();
+            if (d && d.code) return { data: null, error: { message: d.message || d.details } };
+            return { data: Array.isArray(d) ? d : [d], error: null };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        upsert: async function(rows) {
+          try {
+            var body = Array.isArray(rows) ? rows : [rows];
+            var r = await fetch(base + '/rest/v1/' + table, {
+              method: 'POST',
+              headers: Object.assign({}, headers, getAuthHeader(),
+                         { 'Prefer': 'return=representation,resolution=merge-duplicates' }),
+              body: JSON.stringify(body)
+            });
+            var d = await r.json();
+            if (d && d.code) return { data: null, error: { message: d.message } };
+            return { data: d, error: null };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        update: async function(vals) {
+          try {
+            var u = base + '/rest/v1/' + table + '?';
+            _filters.forEach(function(f, i){ u += (i?'&':'') + f; });
+            var r = await fetch(u, {
+              method: 'PATCH',
+              headers: Object.assign({}, headers, getAuthHeader(), { 'Prefer': 'return=representation' }),
+              body: JSON.stringify(vals)
+            });
+            var d = await r.json();
+            if (d && d.code) return { data: null, error: { message: d.message } };
+            return { data: d, error: null };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        delete: async function() {
+          try {
+            var u = base + '/rest/v1/' + table + '?';
+            _filters.forEach(function(f, i){ u += (i?'&':'') + f; });
+            var r = await fetch(u, {
+              method: 'DELETE',
+              headers: Object.assign({}, headers, getAuthHeader())
+            });
+            return { data: null, error: r.ok ? null : { message: 'Delete failed' } };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        filter: function(col, op, val) { _filters.push(col + '=' + op + '.' + encodeURIComponent(val)); return q; }
+      };
+      return q;
+    }
+
+    return { auth: auth, from: from };
+  }
+};
+
+</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ОГЭ Обществознание — Дмитрий Максимов</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#080810">
+
+<style>
+:root{--bg:#080810;--s1:#0f0f1c;--s2:#181828;--s3:#22223a;--soc:#ffaa00;--soc2:#cc7700;--green:#00e5a0;--pink:#ff3377;--math:#00d4ff;--text:#eeeef8;--muted:#5a5a88;--border:rgba(255,255,255,.07);--r:16px;}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Segoe UI','Arial',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
+body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");opacity:.5;}
+
+/* NAV — same animated logo, no math link */
+nav{position:sticky;top:0;z-index:300;display:flex;align-items:center;justify-content:space-between;padding:11px 28px;background:rgba(8,8,16,.95);backdrop-filter:blur(24px);border-bottom:1px solid var(--border);gap:12px;}
+.nav-logo{display:flex;align-items:center;gap:11px;text-decoration:none;flex-shrink:0;}
+.logo-mark{width:42px;height:42px;border-radius:13px;background:var(--s2);border:1.5px solid var(--border);display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;transition:transform .5s cubic-bezier(.34,1.56,.64,1),border-color .3s,box-shadow .3s;}
+.logo-mark::before{content:'';position:absolute;inset:-50%;width:200%;height:200%;background:conic-gradient(from 0deg,var(--math),var(--soc),var(--pink),var(--math));opacity:0;transition:opacity .35s;}
+.nav-logo:hover .logo-mark{transform:rotate(-10deg) scale(1.2);border-color:var(--soc);box-shadow:0 0 0 4px rgba(255,170,0,.18),0 0 28px rgba(255,170,0,.35),0 0 50px rgba(0,212,255,.15);}
+.nav-logo:hover .logo-mark::before{opacity:.28;animation:logospin 3s linear infinite;}
+@keyframes logospin{to{transform:rotate(360deg);}}
+.logo-letters{position:relative;z-index:2;font-family:'Arial Black','Arial',sans-serif;font-size:14px;font-weight:900;display:flex;gap:1px;letter-spacing:-1px;transition:transform .5s cubic-bezier(.34,1.56,.64,1);}
+.nav-logo:hover .logo-letters{transform:scale(1.12);}
+.la{color:var(--math);}
+.lp{color:var(--soc);}
+.logo-text{display:flex;flex-direction:column;line-height:1.25;}
+.logo-main{font-family:'Arial Black','Arial',sans-serif;font-size:13px;font-weight:900;letter-spacing:-.5px;background:linear-gradient(135deg,var(--math),var(--soc));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.logo-sub{font-size:10px;color:var(--muted);}
+
+/* Nav section tabs — social only, no math link */
+.nav-tabs{display:flex;gap:4px;flex:1;justify-content:center;flex-wrap:wrap;}
+.ntab{padding:7px 13px;border-radius:999px;border:1px solid var(--border);background:transparent;color:var(--muted);font-family:'Segoe UI','Arial',sans-serif;font-size:12px;cursor:pointer;transition:all .2s;white-space:nowrap;}
+.ntab:hover{color:var(--text);}
+.ntab.on{background:rgba(255,170,0,.1);border-color:rgba(255,170,0,.3);color:var(--soc);}
+
+/* Profile */
+.profile-btn{position:relative;width:36px;height:36px;border-radius:50%;background:var(--s2);border:1.5px solid var(--border);display:flex;align-items:center;justify-content:center;text-decoration:none;transition:transform .4s cubic-bezier(.34,1.56,.64,1),border-color .25s,box-shadow .25s;flex-shrink:0;}
+.profile-btn svg{width:16px;height:16px;fill:var(--muted);transition:fill .2s;}
+.profile-btn:hover{transform:scale(1.22);border-color:var(--soc);box-shadow:0 0 0 4px rgba(255,170,0,.12),0 0 18px rgba(255,170,0,.2);}
+.profile-btn:hover svg{fill:var(--soc);}
+.pdot{position:absolute;top:-1px;right:-1px;width:9px;height:9px;border-radius:50%;background:var(--green);border:2px solid var(--bg);opacity:0;transform:scale(0);transition:all .3s;}
+.pdot.on{opacity:1;transform:scale(1);}
+
+/* PAGES */
+.pg{max-width:1060px;margin:0 auto;padding:0 28px 80px;display:none;}
+.pg.on{display:block;}
+
+/* HERO */
+.hero-grid{display:grid;grid-template-columns:1.2fr 1fr;gap:48px;align-items:start;padding:50px 0 36px;}
+@media(max-width:700px){.hero-grid{grid-template-columns:1fr;gap:26px;padding:34px 0 24px;}}
+.hero-tag{display:inline-flex;align-items:center;gap:7px;padding:5px 13px;border-radius:999px;background:rgba(255,170,0,.09);border:1px solid rgba(255,170,0,.22);color:var(--soc);font-size:11px;font-weight:600;margin-bottom:14px;}
+.tag-dot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pulse 2s infinite;}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1);}50%{opacity:.3;transform:scale(1.5);}}
+h1{font-family:'Arial Black','Arial',sans-serif;font-size:clamp(24px,3.5vw,48px);font-weight:900;line-height:1.07;letter-spacing:-2px;}
+/* Only the span gets gradient — rest of h1 stays white */
+.hl{background:linear-gradient(135deg,var(--soc),#ffdd66);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;display:inline;}
+.hero-sub{font-size:14px;color:rgba(238,238,248,.6);line-height:1.75;margin:11px 0 22px;max-width:420px;}
+.hero-btns{display:flex;gap:9px;flex-wrap:wrap;}
+.btn-main{padding:12px 22px;border-radius:999px;background:linear-gradient(135deg,var(--soc),var(--soc2));color:#000;font-family:'Segoe UI','Arial',sans-serif;font-size:13px;font-weight:700;border:none;cursor:pointer;transition:all .25s;}
+.btn-main:hover{transform:translateY(-2px);box-shadow:0 0 36px rgba(255,170,0,.35);}
+.btn-ghost{padding:12px 22px;border-radius:999px;background:transparent;color:var(--text);font-family:'Segoe UI','Arial',sans-serif;font-size:13px;border:1px solid var(--border);cursor:pointer;transition:all .2s;}
+.btn-ghost:hover{border-color:rgba(255,255,255,.2);}
+
+/* Auth gate — same as math page */
+.auth-gate{display:none;margin-top:18px;padding:14px 16px;border-radius:12px;background:rgba(255,170,0,.05);border:1px solid rgba(255,170,0,.15);font-size:13px;color:var(--muted);}
+.auth-gate.show{display:block;}
+.auth-gate a{color:var(--soc);text-decoration:none;font-weight:600;}
+.auth-gate a:hover{text-decoration:underline;}
+
+/* Progress ring */
+.prog-card{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:18px;display:none;align-items:center;gap:16px;margin-top:16px;}
+.prog-card.show{display:flex;}
+.ring-wrap{position:relative;flex-shrink:0;}
+.ring-wrap svg{transform:rotate(-90deg);}
+.ring-bg{fill:none;stroke:var(--s2);stroke-width:8;}
+.ring-fill{fill:none;stroke:url(#rgs);stroke-width:8;stroke-linecap:round;stroke-dasharray:283;stroke-dashoffset:283;transition:stroke-dashoffset 1.2s ease;}
+.ring-pct{font-family:'Arial Black','Arial',sans-serif;font-size:16px;font-weight:800;color:var(--soc);}
+.ring-sub{font-size:9px;color:var(--muted);}
+.ring-inner{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;}
+
+/* Tutor card */
+.tutor-card{background:var(--s1);border:1px solid rgba(255,170,0,.15);border-radius:20px;padding:26px;position:relative;overflow:hidden;}
+.tutor-card::before{content:'';position:absolute;top:-80px;right:-60px;width:200px;height:200px;border-radius:50%;background:radial-gradient(circle,rgba(255,170,0,.1),transparent 70%);pointer-events:none;}
+.tutor-av{width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,var(--soc),var(--soc2));display:flex;align-items:center;justify-content:center;font-family:'Arial Black','Arial',sans-serif;font-size:18px;font-weight:900;color:#000;margin-bottom:11px;box-shadow:0 6px 20px rgba(255,170,0,.25);}
+.tutor-name{font-family:'Arial Black','Arial',sans-serif;font-size:14px;font-weight:800;margin-bottom:2px;}
+.tutor-role{font-size:12px;color:var(--soc);margin-bottom:16px;}
+.facts{display:flex;flex-direction:column;gap:8px;}
+.fact{display:flex;align-items:flex-start;gap:9px;padding:9px 12px;border-radius:10px;background:var(--s2);border:1px solid var(--border);font-size:12px;line-height:1.5;color:var(--text);}
+.fi{font-size:14px;flex-shrink:0;margin-top:1px;}
+.fact strong{color:var(--soc);}
+
+/* Stats */
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:36px;}
+@media(max-width:560px){.stats-row{grid-template-columns:1fr 1fr;}}
+.stat-c{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:15px;}
+.stat-n{font-family:'Arial Black','Arial',sans-serif;font-size:21px;font-weight:800;color:var(--soc);}
+.stat-l{font-size:11px;color:var(--muted);margin-top:2px;}
+
+/* Section */
+.sec-t{font-family:'Arial Black','Arial',sans-serif;font-size:clamp(17px,2.5vw,24px);font-weight:800;letter-spacing:-1px;margin-bottom:4px;margin-top:36px;}
+.sec-s{color:var(--muted);font-size:13px;margin-bottom:20px;line-height:1.6;}
+
+/* Topics */
+.topics-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:11px;}
+.topic-c{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:18px;cursor:pointer;transition:all .25s;position:relative;overflow:hidden;}
+.topic-c::after{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--soc),#ffdd66);transform:scaleX(0);transform-origin:left;transition:transform .3s;}
+.topic-c:hover{border-color:rgba(255,170,0,.3);transform:translateY(-3px);}
+.topic-c:hover::after{transform:scaleX(1);}
+.t-icon{width:38px;height:38px;border-radius:10px;background:rgba(255,170,0,.1);display:flex;align-items:center;justify-content:center;font-size:17px;margin-bottom:9px;}
+.t-name{font-family:'Arial Black','Arial',sans-serif;font-size:11px;font-weight:700;margin-bottom:3px;color:var(--text);}
+.t-desc{font-size:11px;color:var(--muted);line-height:1.5;}
+
+/* Filter */
+.filter-row{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:16px;}
+.fb{padding:6px 12px;border-radius:999px;border:1px solid var(--border);background:transparent;color:var(--muted);font-family:'Segoe UI','Arial',sans-serif;font-size:12px;cursor:pointer;transition:all .2s;}
+.fb.on{background:rgba(255,170,0,.09);border-color:rgba(255,170,0,.35);color:var(--soc);}
+
+/* Tasks */
+.tasks-grid{display:grid;gap:11px;}
+.task-c{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:19px;transition:border-color .2s;}
+.task-c:hover{border-color:rgba(255,170,0,.18);}
+.t-meta{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:9px;}
+.t-num{font-family:'Arial Black','Arial',sans-serif;font-size:10px;color:var(--soc);font-weight:600;}
+.t-topic{font-size:10px;color:var(--muted);margin-top:2px;}
+.diff{padding:3px 9px;border-radius:999px;font-size:10px;font-weight:600;}
+.de{background:rgba(0,229,160,.1);color:var(--green);}
+.dm{background:rgba(255,170,0,.1);color:var(--soc);}
+.dh{background:rgba(255,51,119,.1);color:var(--pink);}
+.task-q{font-size:14px;line-height:1.75;margin-bottom:13px;color:var(--text);}
+.opts-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+@media(max-width:480px){.opts-grid{grid-template-columns:1fr;}}
+.opt-b{padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--s2);color:var(--text);font-family:'Segoe UI','Arial',sans-serif;font-size:13px;cursor:pointer;text-align:left;transition:all .2s;}
+.opt-b:hover:not(:disabled){border-color:var(--soc);background:rgba(255,170,0,.07);}
+.opt-b.ok{border-color:var(--green)!important;background:rgba(0,229,160,.1)!important;color:var(--green)!important;}
+.opt-b.no{border-color:var(--pink)!important;background:rgba(255,51,119,.1)!important;color:var(--pink)!important;}
+.inp-row{display:flex;gap:8px;}
+.t-inp{flex:1;padding:10px 12px;border-radius:10px;background:var(--s2);border:1px solid var(--border);color:var(--text);font-family:'Segoe UI','Arial',sans-serif;font-size:14px;outline:none;transition:border-color .2s;}
+.t-inp:focus{border-color:var(--soc);}
+.t-inp.ok{border-color:var(--green)!important;}
+.t-inp.no{border-color:var(--pink)!important;}
+.chk-btn{padding:10px 16px;border-radius:10px;background:var(--soc);color:#000;font-family:'Segoe UI','Arial',sans-serif;font-size:12px;font-weight:600;border:none;cursor:pointer;}
+.ext-wrap{display:flex;flex-direction:column;gap:8px;}
+.ext-wrap textarea{width:100%;padding:11px 13px;border-radius:10px;background:var(--s2);border:1px solid var(--border);color:var(--text);font-family:'Segoe UI','Arial',sans-serif;font-size:14px;outline:none;resize:vertical;min-height:85px;transition:border-color .2s;}
+.ext-wrap textarea:focus{border-color:var(--soc);}
+.ext-send{padding:10px 17px;border-radius:10px;background:linear-gradient(135deg,var(--soc),var(--soc2));color:#000;font-family:'Segoe UI','Arial',sans-serif;font-size:12px;font-weight:600;border:none;cursor:pointer;align-self:flex-end;}
+.ans-box{margin-top:9px;padding:11px 13px;border-radius:10px;background:rgba(255,170,0,.06);border:1px solid rgba(255,170,0,.17);font-size:12px;line-height:1.7;display:none;color:var(--text);}
+.ans-box.on{display:block;}
+.sent-ok{margin-top:7px;padding:8px 12px;border-radius:10px;background:rgba(0,229,160,.1);border:1px solid rgba(0,229,160,.2);font-size:12px;color:var(--green);display:none;}
+.sent-ok.on{display:block;}
+
+/* HW */
+.hw-grid{display:grid;gap:10px;}
+.hw-c{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:15px;display:flex;align-items:center;gap:13px;}
+.hw-ico{width:40px;height:40px;border-radius:11px;background:rgba(255,170,0,.1);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;}
+.hw-body{flex:1;}
+.hw-t{font-weight:600;font-size:13px;margin-bottom:2px;color:var(--text);}
+.hw-m{font-size:11px;color:var(--muted);}
+.hw-st{padding:4px 10px;border-radius:999px;font-size:10px;font-weight:600;}
+.st-n{background:rgba(255,170,0,.1);color:var(--soc);}
+.st-d{background:rgba(0,229,160,.1);color:var(--green);}
+
+/* Plan */
+.plan-t{width:100%;border-collapse:collapse;}
+.plan-t th{background:var(--s2);padding:10px 15px;font-family:'Arial Black','Arial',sans-serif;font-size:9px;font-weight:700;color:var(--muted);text-align:left;letter-spacing:1px;text-transform:uppercase;}
+.plan-t td{padding:10px 15px;border-top:1px solid var(--border);font-size:12px;color:var(--text);}
+.plan-t tr:hover td{background:rgba(255,255,255,.02);}
+.ph1{padding:3px 9px;border-radius:999px;font-size:10px;font-weight:600;background:rgba(255,170,0,.1);color:var(--soc);}
+.ph2{padding:3px 9px;border-radius:999px;font-size:10px;font-weight:600;background:rgba(255,100,0,.1);color:#ff7700;}
+.ph3{padding:3px 9px;border-radius:999px;font-size:10px;font-weight:600;background:rgba(255,51,119,.1);color:var(--pink);}
+
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(16px);z-index:2000;padding:11px 20px;border-radius:11px;background:var(--s2);border:1px solid var(--border);font-size:13px;opacity:0;transition:all .3s;pointer-events:none;white-space:nowrap;}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+.toast.ok{border-color:rgba(0,229,160,.3);color:var(--green);}
+
+@media(max-width:480px){nav{padding:9px 12px;}.logo-text{display:none;}.pg{padding:0 12px 60px;}}
+</style>
+</head>
+<body>
+<nav>
+  <a class="nav-logo" href="index.html">
+    <div class="logo-mark">
+      <div class="logo-letters"><span class="la">А</span><span class="lp">П</span></div>
+    </div>
+    <div class="logo-text">
+      <div class="logo-main">ОГЭ Платформа</div>
+      <div class="logo-sub">На главную</div>
+    </div>
+  </a>
+
+  <div class="nav-tabs">
+    <button class="ntab on" onclick="sw('home',this)">Главная</button>
+    <button class="ntab"    onclick="sw('topics',this)">Темы</button>
+    <button class="ntab"    onclick="sw('tasks',this)">Задачи</button>
+    <button class="ntab"    onclick="sw('hw',this)">ДЗ</button>
+    <button class="ntab"    onclick="sw('plan',this)">План</button>
+  </div>
+
+  <a class="profile-btn" href="cabinet.html">
+    <div class="pdot" id="pdot"></div>
+    <svg viewBox="0 0 24 24"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/></svg>
+  </a>
+</nav>
+
+<!-- HOME -->
+<div class="pg on" id="pg-home">
+  <div class="hero-grid">
+    <div>
+      <div class="hero-tag"><span class="tag-dot"></span>ОГЭ 2025 — Обществознание</div>
+      <h1>Сдай ОГЭ<br>на <span class="hl">отлично</span><br>с первого раза</h1>
+      <p class="hero-sub">Персональная подготовка с Дмитрием Максимовым. Структурированные темы, разборы эссе, прогресс по каждому разделу.</p>
+      <div class="hero-btns">
+        <button class="btn-main" onclick="sw('tasks',null)">Начать решать →</button>
+        <button class="btn-ghost" onclick="sw('plan',null)">Смотреть план</button>
+      </div>
+
+      <!-- Auth gate — same pattern as math.html -->
+      <div class="auth-gate show" id="authGate">
+        🔒 <a href="cabinet.html">Войдите</a>, чтобы отслеживать прогресс и получать домашние задания от Дмитрия
+      </div>
+
+      <!-- Progress ring — shown when logged in -->
+      <div class="prog-card" id="progCard">
+        <div class="ring-wrap">
+          <svg width="76" height="76" viewBox="0 0 100 100">
+            <defs><linearGradient id="rgs" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#ffaa00"/><stop offset="100%" stop-color="#ff3377"/></linearGradient></defs>
+            <circle class="ring-bg" cx="50" cy="50" r="45"/>
+            <circle class="ring-fill" id="ringFill" cx="50" cy="50" r="45"/>
+          </svg>
+          <div class="ring-inner"><div class="ring-pct" id="ringPct">0%</div><div class="ring-sub">пройдено</div></div>
+        </div>
+        <div>
+          <div style="font-size:13px;font-weight:600;margin-bottom:3px;">Мой прогресс</div>
+          <div style="font-size:12px;color:var(--muted);" id="progText">Загрузка...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tutor card — correct Dmitry bio -->
+    <div class="tutor-card">
+      <div class="tutor-av">ДМ</div>
+      <div class="tutor-name">Дмитрий Максимов</div>
+      <div class="tutor-role">Преподаватель обществознания</div>
+      <div class="facts">
+        <div class="fact"><span class="fi">🏆</span>Закончил школу с <strong>красным дипломом</strong></div>
+        <div class="fact"><span class="fi">📝</span>Сдал ЕГЭ по обществознанию на <strong>87 баллов</strong></div>
+        <div class="fact"><span class="fi">🎓</span>Студент <strong>РАНХиГС</strong></div>
+        <div class="fact"><span class="fi">🖊️</span>Разбираю каждое эссе с <strong>подробным комментарием</strong></div>
+        <div class="fact"><span class="fi">💬</span>Пишу отчёт родителям после <strong>каждого занятия</strong></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat-c"><div class="stat-n">10</div><div class="stat-l">тем курса</div></div>
+    <div class="stat-c"><div class="stat-n">30+</div><div class="stat-l">задач</div></div>
+    <div class="stat-c"><div class="stat-n">92%</div><div class="stat-l">сдают 4–5</div></div>
+    <div class="stat-c"><div class="stat-n">12 нед</div><div class="stat-l">до результата</div></div>
+  </div>
+</div>
+
+<!-- TOPICS -->
+<div class="pg" id="pg-topics">
+  <div class="sec-t">Темы курса</div>
+  <div class="sec-s">10 разделов ОГЭ — нажми на тему чтобы перейти к задачам</div>
+  <div class="topics-grid" id="topicsGrid"></div>
+</div>
+
+<!-- TASKS -->
+<div class="pg" id="pg-tasks">
+  <div class="sec-t">Задачи ОГЭ</div>
+  <div class="sec-s">Тестовые и развёрнутые задания — загружает Дмитрий из кабинета</div>
+  <div class="filter-row" id="filterRow"></div>
+  <div class="tasks-grid" id="tasksGrid"><div style="color:var(--muted);padding:20px 0;">⏳ Загрузка...</div></div>
+</div>
+
+<!-- HW -->
+<div class="pg" id="pg-hw">
+  <div class="sec-t">Домашние задания</div>
+  <div class="sec-s">Задания от Дмитрия — выполни в срок</div>
+  <div class="hw-grid" id="hwGrid"></div>
+</div>
+
+<!-- PLAN -->
+<div class="pg" id="pg-plan">
+  <div class="sec-t">12-недельный план</div>
+  <div class="sec-s">Авторская система подготовки Дмитрия Максимова</div>
+  <table class="plan-t">
+    <thead><tr><th>Этап</th><th>Недели</th><th>Темы</th><th>Цель</th></tr></thead>
+    <tbody id="planBody"></tbody>
+  </table>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+var _SB_URL = 'https://vumpkvjmkgdzleltvwks.supabase.co';
+var _SB_KEY = 'sb_publishable_rNoVZMRI6CkPJWOYgOEjgQ_V7nh1b2x';
+var supabase = window.supabase.createClient(_SB_URL, _SB_KEY);
+
+(async function() {
+// Auth state — show/hide progress exactly like math.html
+const {data:{session}} = await supabase.auth.getSession();
+if (session) {
+  document.getElementById('pdot').classList.add('on');
+  document.getElementById('authGate').classList.remove('show');
+  document.getElementById('progCard').classList.add('show');
+  loadProgress(session.user.id);
+}
+supabase.auth.onAuthStateChange((_,s) => {
+  document.getElementById('pdot').classList.toggle('on', !!s);
+  if (s) {
+    document.getElementById('authGate').classList.remove('show');
+    document.getElementById('progCard').classList.add('show');
+    loadProgress(s.user.id);
+  }
+});
+
+async function loadProgress(uid) {
+  const {data} = await supabase.from('submissions').select('id').eq('user_id',uid).eq('subject','social');
+  const n=data?.length||0, total=30, pct=Math.min(100,Math.round(n/total*100));
+  document.getElementById('ringPct').textContent=pct+'%';
+  document.getElementById('progText').textContent=n+' задач решено из '+total;
+  document.getElementById('ringFill').style.strokeDashoffset=283-(283*pct/100);
+}
+
+// Tasks
+let allTasks=[];
+const SAMPLE=[
+  {id:'s1',topic:'Право',num:'Задание №1',diff:'easy',question:'Что является высшей ценностью по Конституции РФ?',type:'test',options:['Государство','Человек, его права и свободы','Территория страны','Государственный суверенитет'],answer:'Человек, его права и свободы',explain:'Статья 2 Конституции РФ: «Человек, его права и свободы являются высшей ценностью».'},
+  {id:'s2',topic:'Право',num:'Задание №2',diff:'easy',question:'С какого возраста наступает полная гражданская дееспособность в РФ?',type:'test',options:['14 лет','16 лет','18 лет','21 год'],answer:'18 лет',explain:'Гражданский кодекс РФ, ст. 21: полная дееспособность наступает с 18 лет.'},
+  {id:'s3',topic:'Экономика',num:'Задание №3',diff:'mid',question:'Что такое ВВП?',type:'test',options:['Сумма всех налогов','Рыночная стоимость всех конечных товаров и услуг за год','Объём госдолга','Размер экспорта'],answer:'Рыночная стоимость всех конечных товаров и услуг за год',explain:'ВВП — валовой внутренний продукт. Суммарная стоимость всех товаров и услуг, произведённых внутри страны за год.'},
+  {id:'s4',topic:'Политика',num:'Задание №4',diff:'mid',question:'Как часто избирается Государственная Дума РФ?',type:'test',options:['Раз в 4 года','Раз в 5 лет','Раз в 6 лет','Раз в 2 года'],answer:'Раз в 5 лет',explain:'По Конституции РФ (ст.96) Государственная Дума избирается на 5 лет.'},
+  {id:'s5',topic:'Социальные отношения',num:'Задание №5',diff:'mid',question:'Что такое вертикальная социальная мобильность?',type:'test',options:['Переезд из одного города в другой','Смена профессии без изменения статуса','Переход из одного социального слоя в другой','Изменение гражданства'],answer:'Переход из одного социального слоя в другой',explain:'Вертикальная мобильность — движение вверх (рост статуса) или вниз по социальной лестнице.'},
+  {id:'s6',topic:'Человек и общество',num:'Задание №6',diff:'easy',question:'Что из перечисленного является признаком гражданского общества?',type:'test',options:['Наличие армии','Независимость НКО от государства','Единая государственная идеология','Плановая экономика'],answer:'Независимость НКО от государства',explain:'Гражданское общество — сфера самоорганизации граждан, независимая от государства. НКО — его ключевой элемент.'},
+  {id:'s7',topic:'Экономика',num:'Задание №7',diff:'easy',question:'Как называется ситуация, когда расходы бюджета превышают доходы?',type:'test',options:['Профицит','Дефицит','Эмиссия','Субсидия'],answer:'Дефицит',explain:'Дефицит бюджета — превышение государственных расходов над доходами.'},
+  {id:'s8',topic:'Семья и брак',num:'Задание №8',diff:'easy',question:'Какой тип семьи характерен для современного общества?',type:'test',options:['Расширенная (многопоколенная)','Нуклеарная (родители + дети)','Клановая','Полигамная'],answer:'Нуклеарная (родители + дети)',explain:'Для постиндустриального общества характерна нуклеарная семья — родители и их дети.'},
+  {id:'s9',topic:'Духовная сфера',num:'Задание №9',diff:'easy',question:'Что относится к духовной сфере общества?',type:'test',options:['Производство товаров','Государственное управление','Создание произведений искусства','Рыночные отношения'],answer:'Создание произведений искусства',explain:'Духовная сфера — область создания и распространения духовных ценностей: искусство, наука, религия, образование.'},
+  {id:'s10',topic:'Задание 29 — эссе',num:'Задание 29',diff:'hard',question:'Напишите мини-эссе по высказыванию Н. Бердяева: «Государство существует не для того, чтобы превращать земную жизнь в рай, а для того, чтобы помешать ей окончательно превратиться в ад». Раскройте смысл, приведите 2 аргумента.',type:'extended',answer:'Государство как сдерживающий институт. Аргументы: 1) правопорядок (полиция, суды); 2) социальная защита уязвимых.',explain:'Структура эссе: 1) Смысл (2–3 предл.). 2) Теоретический аргумент с понятиями. 3) Фактический аргумент из истории/жизни. 4) Вывод.'},
+];
+
+async function loadTasks(){
+  const{data,error}=await supabase.from('tasks').select('*').eq('subject','social').order('created_at',{ascending:false});
+  allTasks=(error||!data?.length)?SAMPLE:data;
+  buildFilters('Все');renderTasks('Все');
+}
+loadTasks();
+
+function buildFilters(active){
+  const fr=document.getElementById('filterRow');fr.innerHTML='';
+  ['Все',...new Set(allTasks.map(t=>t.topic))].forEach(tp=>{
+    const b=document.createElement('button');
+    b.className='fb'+(tp===active?' on':'');
+    b.textContent=tp==='Все'?'Все темы':tp;
+    b.onclick=()=>{document.querySelectorAll('.fb').forEach(x=>x.classList.remove('on'));b.classList.add('on');renderTasks(tp);};
+    fr.appendChild(b);
+  });
+}
+
+function renderTasks(filter){
+  const grid=document.getElementById('tasksGrid');
+  const list=filter==='Все'?allTasks:allTasks.filter(t=>t.topic===filter);
+  if(!list.length){grid.innerHTML='<div style="color:var(--muted);padding:20px 0;">Нет задач по этой теме</div>';return;}
+  grid.innerHTML=list.map(t=>{
+    const dc=t.diff==='easy'?'de':t.diff==='mid'?'dm':'dh';
+    const dl=t.diff==='easy'?'Лёгкое':t.diff==='mid'?'Среднее':'Сложное';
+    const opts=Array.isArray(t.options)?t.options:(typeof t.options==='string'?JSON.parse(t.options||'[]'):[]);
+    const esc=s=>(s||'').replace(/'/g,"\\'").replace(/"/g,'&quot;');
+    let inp='';
+    if(t.type==='test'){
+      inp=`<div class="opts-grid">${opts.map(o=>`<button class="opt-b" onclick="chkOpt(this,'${esc(o)}','${esc(t.answer)}','${t.id}')">${o}</button>`).join('')}</div>`;
+    } else if(t.type==='extended'){
+      inp=`<div class="ext-wrap"><textarea id="ext_${t.id}" placeholder="Развёрнутый ответ..."></textarea><button class="ext-send" onclick="sendExt('${t.id}','${esc(t.num||'Задание')}')">Отправить Дмитрию →</button><div class="sent-ok" id="sok_${t.id}">✓ Отправлено на проверку</div></div>`;
+    } else {
+      inp=`<div class="inp-row"><input class="t-inp" id="inp_${t.id}" placeholder="Ответ..." onkeydown="if(event.key==='Enter')chkInp('${t.id}','${esc(t.answer)}')"><button class="chk-btn" onclick="chkInp('${t.id}','${esc(t.answer)}')">Проверить</button></div>`;
+    }
+    return `<div class="task-c"><div class="t-meta"><div><div class="t-num">${t.num||'Задание'}</div><div class="t-topic">${t.topic||''}</div></div><span class="diff ${dc}">${dl}</span></div><div class="task-q">${t.question||''}</div>${inp}<div class="ans-box" id="ans_${t.id}">💡 <strong>Разбор:</strong> ${t.explain||t.answer||''}</div></div>`;
+  }).join('');
+}
+})();
+
+window.chkOpt=function(btn,val,answer,id){btn.closest('.opts-grid').querySelectorAll('.opt-b').forEach(b=>{b.classList.remove('ok','no');b.disabled=true;});btn.classList.add(val===answer?'ok':'no');if(val!==answer)btn.closest('.opts-grid').querySelectorAll('.opt-b').forEach(b=>{if(b.textContent===answer)b.classList.add('ok');});document.getElementById('ans_'+id).classList.add('on');};
+window.chkInp=function(id,answer){const i=document.getElementById('inp_'+id);i.classList.remove('ok','no');i.classList.add(i.value.trim()===answer?'ok':'no');document.getElementById('ans_'+id).classList.add('on');};
+window.sendExt=async function(id,num){const{data:{session}}=await supabase.auth.getSession();const text=document.getElementById('ext_'+id)?.value?.trim();if(!text)return;if(session)await supabase.from('submissions').insert({task_id:id,task_num:num,subject:'social',answer:text,user_id:session.user.id,user_name:session.user.user_metadata?.name||session.user.email,checked:false});document.getElementById('sok_'+id).classList.add('on');document.getElementById('ans_'+id).classList.add('on');};
+
+// HW
+async function loadHw(){
+  const el=document.getElementById('hwGrid');
+  const{data,error}=await supabase.from('homework').select('*').eq('subject','social').order('created_at',{ascending:false});
+  if(error||!data?.length){el.innerHTML=`<div class="hw-c"><div class="hw-ico">🖊️</div><div class="hw-body"><div class="hw-t">Эссе: «Демократия — худшая форма правления, не считая всех остальных»</div><div class="hw-m">150–200 слов · Срок: пятница</div></div><span class="hw-st st-n">Новое</span></div><div class="hw-c"><div class="hw-ico">📋</div><div class="hw-body"><div class="hw-t">Тест: Экономика (задания 1–10)</div><div class="hw-m">Срок: среда</div></div><span class="hw-st st-n">Новое</span></div>`;return;}
+  el.innerHTML=data.map(h=>`<div class="hw-c"><div class="hw-ico">📝</div><div class="hw-body"><div class="hw-t">${h.title}</div><div class="hw-m">${h.description||''} ${h.deadline?'· Срок: '+new Date(h.deadline).toLocaleString('ru-RU',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}):''}</div></div><span class="hw-st st-n">Новое</span></div>`).join('');
+}
+loadHw();
+
+// Topics
+const TOPICS=[{i:'🏛️',n:'Человек и общество',d:'Типы общества, социализация, деятельность'},{i:'🌐',n:'Сферы общества',d:'Политика, экономика, духовная, социальная'},{i:'💰',n:'Экономика',d:'Рынок, спрос, ВВП, инфляция, налоги'},{i:'⚖️',n:'Право',d:'Конституция РФ, отрасли права, дееспособность'},{i:'👥',n:'Социальные отношения',d:'Стратификация, мобильность, конфликты'},{i:'🗳️',n:'Политика',d:'Государство, демократия, выборы, власть'},{i:'📖',n:'Духовная сфера',d:'Культура, религия, образование, наука'},{i:'👨‍👩‍👧',n:'Семья и брак',d:'Типы семьи, функции, демография'},{i:'🖊️',n:'Задание 29 — эссе',d:'Структура, аргументация, критерии'},{i:'📑',n:'Форматы заданий ОГЭ',d:'Задания 1–29: типы, баллы, стратегия'}];
+document.getElementById('topicsGrid').innerHTML=TOPICS.map(t=>`<div class="topic-c" onclick="filterTopic('${t.n}')"><div class="t-icon">${t.i}</div><div class="t-name">${t.n}</div><div class="t-desc">${t.d}</div></div>`).join('');
+window.filterTopic=n=>{sw('tasks',null);buildFilters(n);renderTasks(n);};
+
+// Plan
+const PLAN=[{ph:'ph1',w:'1–2',tp:'Человек и общество, типы общества',g:'Понять базовые понятия'},{ph:'ph1',w:'3–4',tp:'Сферы общественной жизни',g:'Ориентироваться в структуре'},{ph:'ph2',w:'5–6',tp:'Экономика: рынок, ВВП, инфляция',g:'Решать задания по экономике'},{ph:'ph2',w:'7–8',tp:'Право: Конституция, отрасли',g:'Уверенность в правовых вопросах'},{ph:'ph2',w:'9',tp:'Политика: государство, власть',g:'Разбираться в политсистеме'},{ph:'ph3',w:'10',tp:'Социальные отношения, семья',g:'Закрыть социальный блок'},{ph:'ph3',w:'11',tp:'Задание 29 — эссе',g:'Структура + аргументы'},{ph:'ph3',w:'12',tp:'Полные варианты ОГЭ по времени',g:'Скорость + уверенность = 5'}];
+document.getElementById('planBody').innerHTML=PLAN.map(p=>`<tr><td><span class="${p.ph}">${p.ph==='ph1'?'Этап 1':p.ph==='ph2'?'Этап 2':'Этап 3'}</span></td><td style="color:var(--muted)">${p.w}</td><td>${p.tp}</td><td style="color:var(--soc)">${p.g}</td></tr>`).join('');
+</script>
+</script>
+
+<script>
+window.sw=function(id,btn){document.querySelectorAll('.pg').forEach(p=>p.classList.remove('on'));document.getElementById('pg-'+id).classList.add('on');document.querySelectorAll('.ntab').forEach(b=>b.classList.remove('on'));if(btn)btn.classList.add('on');};
+
+</script>
+</body>
+</html>

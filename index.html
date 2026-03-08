@@ -1,0 +1,496 @@
+<!-- OGE-PLATFORM-V4-FINAL -->
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<script>
+// ╔══════════════════════════════════════════════════════╗
+// ║  Минимальный Supabase клиент — без CDN, чистый fetch ║
+// ║  Покрывает: auth + from().select/insert/update/delete║
+// ╚══════════════════════════════════════════════════════╝
+window.supabase = {
+  createClient: function(url, key) {
+    var base = url.replace(/\/$/, '');
+    var headers = { 'apikey': key, 'Content-Type': 'application/json' };
+
+    // ── Хранение сессии ──
+    var SESSION_KEY = 'sb_session';
+    var _session = null;
+    var _authListeners = [];
+
+    function saveSession(s) {
+      _session = s;
+      try { localStorage.setItem(SESSION_KEY, JSON.stringify(s)); } catch(e){}
+      _authListeners.forEach(function(fn){ fn('SIGNED_IN', s); });
+    }
+    function clearSession() {
+      _session = null;
+      try { localStorage.removeItem(SESSION_KEY); } catch(e){}
+      _authListeners.forEach(function(fn){ fn('SIGNED_OUT', null); });
+    }
+    function loadSession() {
+      if (_session) return _session;
+      try {
+        var raw = localStorage.getItem(SESSION_KEY);
+        if (raw) { _session = JSON.parse(raw); return _session; }
+      } catch(e){}
+      return null;
+    }
+
+    // ── AUTH ──
+    var auth = {
+      getSession: async function() {
+        var s = loadSession();
+        // Refresh if expired
+        if (s && s.expires_at && Date.now() / 1000 > s.expires_at - 60) {
+          try {
+            var r = await fetch(base + '/auth/v1/token?grant_type=refresh_token', {
+              method: 'POST',
+              headers: headers,
+              body: JSON.stringify({ refresh_token: s.refresh_token })
+            });
+            var d = await r.json();
+            if (d.access_token) {
+              s = { access_token: d.access_token, refresh_token: d.refresh_token,
+                    expires_at: Math.floor(Date.now()/1000) + (d.expires_in||3600), user: d.user };
+              saveSession(s);
+            } else { clearSession(); return { data: { session: null }, error: null }; }
+          } catch(e) { return { data: { session: loadSession() }, error: null }; }
+        }
+        return { data: { session: s }, error: null };
+      },
+
+      onAuthStateChange: function(callback) {
+        _authListeners.push(callback);
+        // Fire immediately with current state
+        var s = loadSession();
+        if (s) setTimeout(function(){ callback('SIGNED_IN', s); }, 0);
+        return { data: { subscription: { unsubscribe: function(){
+          _authListeners = _authListeners.filter(function(f){ return f !== callback; });
+        }}}};
+      },
+
+      signInWithPassword: async function(opts) {
+        try {
+          var r = await fetch(base + '/auth/v1/token?grant_type=password', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ email: opts.email, password: opts.password })
+          });
+          var d = await r.json();
+          if (d.error || d.error_description || d.msg) {
+            var msg = d.error_description || d.msg || d.error || 'Ошибка входа';
+            if (msg.includes('Invalid login')) msg = 'Invalid login credentials';
+            return { data: null, error: { message: msg } };
+          }
+          var s = { access_token: d.access_token, refresh_token: d.refresh_token,
+                    expires_at: Math.floor(Date.now()/1000) + (d.expires_in||3600), user: d.user };
+          saveSession(s);
+          return { data: { session: s, user: d.user }, error: null };
+        } catch(e) { return { data: null, error: { message: e.message } }; }
+      },
+
+      signUp: async function(opts) {
+        try {
+          var r = await fetch(base + '/auth/v1/signup', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ email: opts.email, password: opts.password,
+                                   data: (opts.options && opts.options.data) || {} })
+          });
+          var d = await r.json();
+          if (d.error || d.error_description) {
+            return { data: null, error: { message: d.error_description || d.error } };
+          }
+          // Auto-login after signup
+          var s = null;
+          if (d.access_token) {
+            s = { access_token: d.access_token, refresh_token: d.refresh_token,
+                  expires_at: Math.floor(Date.now()/1000) + (d.expires_in||3600), user: d.user };
+            saveSession(s);
+          }
+          return { data: { session: s, user: d.user || d }, error: null };
+        } catch(e) { return { data: null, error: { message: e.message } }; }
+      },
+
+      signOut: async function() {
+        var s = loadSession();
+        if (s) {
+          try {
+            await fetch(base + '/auth/v1/logout', {
+              method: 'POST',
+              headers: Object.assign({}, headers, { 'Authorization': 'Bearer ' + s.access_token })
+            });
+          } catch(e){}
+        }
+        clearSession();
+        return { error: null };
+      }
+    };
+
+    // ── DATABASE (PostgREST) ──
+    function from(table) {
+      var _filters = [];
+      var _select = '*';
+      var _order = null;
+      var _limit = null;
+
+      function getAuthHeader() {
+        var s = loadSession();
+        if (s && s.access_token) return { 'Authorization': 'Bearer ' + s.access_token };
+        return {};
+      }
+
+      function buildUrl() {
+        var u = base + '/rest/v1/' + table + '?select=' + _select;
+        _filters.forEach(function(f){ u += '&' + f; });
+        if (_order) u += '&order=' + _order;
+        if (_limit) u += '&limit=' + _limit;
+        return u;
+      }
+
+      var q = {
+        select: function(cols) { _select = cols || '*'; return q; },
+        eq:     function(col, val) { _filters.push(col + '=eq.' + encodeURIComponent(val)); return q; },
+        neq:    function(col, val) { _filters.push(col + '=neq.' + encodeURIComponent(val)); return q; },
+        or:     function(expr) { _filters.push('or=(' + expr + ')'); return q; },
+        order:  function(col, opts) {
+          _order = col + (opts && opts.ascending === false ? '.desc' : '.asc');
+          return q;
+        },
+        limit:  function(n) { _limit = n; return q; },
+
+        // Execute SELECT
+        then: function(resolve, reject) {
+          return fetch(buildUrl(), {
+            headers: Object.assign({}, headers, getAuthHeader(),
+                       { 'Prefer': 'return=representation' })
+          })
+          .then(function(r){ return r.json(); })
+          .then(function(d){
+            if (d && d.code && d.message) resolve({ data: null, error: { message: d.message } });
+            else resolve({ data: Array.isArray(d) ? d : [], error: null });
+          })
+          .catch(function(e){ resolve({ data: null, error: { message: e.message } }); });
+        },
+
+        insert: async function(rows) {
+          try {
+            var body = Array.isArray(rows) ? rows : [rows];
+            var r = await fetch(base + '/rest/v1/' + table, {
+              method: 'POST',
+              headers: Object.assign({}, headers, getAuthHeader(), { 'Prefer': 'return=representation' }),
+              body: JSON.stringify(body)
+            });
+            var d = await r.json();
+            if (d && d.code) return { data: null, error: { message: d.message || d.details } };
+            return { data: Array.isArray(d) ? d : [d], error: null };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        upsert: async function(rows) {
+          try {
+            var body = Array.isArray(rows) ? rows : [rows];
+            var r = await fetch(base + '/rest/v1/' + table, {
+              method: 'POST',
+              headers: Object.assign({}, headers, getAuthHeader(),
+                         { 'Prefer': 'return=representation,resolution=merge-duplicates' }),
+              body: JSON.stringify(body)
+            });
+            var d = await r.json();
+            if (d && d.code) return { data: null, error: { message: d.message } };
+            return { data: d, error: null };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        update: async function(vals) {
+          try {
+            var u = base + '/rest/v1/' + table + '?';
+            _filters.forEach(function(f, i){ u += (i?'&':'') + f; });
+            var r = await fetch(u, {
+              method: 'PATCH',
+              headers: Object.assign({}, headers, getAuthHeader(), { 'Prefer': 'return=representation' }),
+              body: JSON.stringify(vals)
+            });
+            var d = await r.json();
+            if (d && d.code) return { data: null, error: { message: d.message } };
+            return { data: d, error: null };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        delete: async function() {
+          try {
+            var u = base + '/rest/v1/' + table + '?';
+            _filters.forEach(function(f, i){ u += (i?'&':'') + f; });
+            var r = await fetch(u, {
+              method: 'DELETE',
+              headers: Object.assign({}, headers, getAuthHeader())
+            });
+            return { data: null, error: r.ok ? null : { message: 'Delete failed' } };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        filter: function(col, op, val) { _filters.push(col + '=' + op + '.' + encodeURIComponent(val)); return q; }
+      };
+      return q;
+    }
+
+    return { auth: auth, from: from };
+  }
+};
+
+</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ОГЭ Платформа — Пястолов & Максимов</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#080810">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="apple-touch-icon" href="icon-180.png">
+
+<style>
+:root{--bg:#080810;--s1:#0f0f1c;--s2:#181828;--s3:#22223a;--math:#00d4ff;--soc:#ffaa00;--pink:#ff3377;--green:#00e5a0;--text:#eeeef8;--muted:#5a5a88;--border:rgba(255,255,255,.07);--r:18px;}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Segoe UI','Arial',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
+body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E");opacity:.5;}
+
+/* NAV */
+nav{position:sticky;top:0;z-index:300;display:flex;align-items:center;justify-content:space-between;padding:12px 32px;background:rgba(8,8,16,.95);backdrop-filter:blur(24px);border-bottom:1px solid var(--border);gap:16px;}
+
+/* Logo — large, animated, dual-color */
+.nav-logo{display:flex;align-items:center;gap:12px;text-decoration:none;flex-shrink:0;}
+.logo-mark{
+  width:46px;height:46px;border-radius:14px;
+  background:var(--s2);border:1.5px solid var(--border);
+  display:flex;align-items:center;justify-content:center;
+  position:relative;overflow:hidden;
+  transition:transform .5s cubic-bezier(.34,1.56,.64,1),border-color .3s,box-shadow .3s;
+}
+/* Rotating gradient behind letters */
+.logo-mark::before{
+  content:'';position:absolute;inset:-50%;width:200%;height:200%;
+  background:conic-gradient(from 0deg,var(--math),var(--soc),var(--pink),var(--math));
+  opacity:0;transition:opacity .4s;
+  animation:none;
+}
+.nav-logo:hover .logo-mark{
+  transform:rotate(-10deg) scale(1.2);
+  border-color:var(--math);
+  box-shadow:0 0 0 4px rgba(0,212,255,.18),0 0 32px rgba(0,212,255,.35),0 0 56px rgba(255,170,0,.15);
+}
+.nav-logo:hover .logo-mark::before{opacity:.25;animation:logospin 3s linear infinite;}
+@keyframes logospin{to{transform:rotate(360deg);}}
+.logo-letters{
+  position:relative;z-index:2;
+  font-family:'Arial Black','Arial',sans-serif;font-size:15px;font-weight:900;
+  display:flex;gap:1px;letter-spacing:-1px;
+  transition:transform .5s cubic-bezier(.34,1.56,.64,1);
+}
+.nav-logo:hover .logo-letters{transform:scale(1.12);}
+.la{color:var(--math);}
+.lp{color:var(--soc);}
+.logo-text{display:flex;flex-direction:column;line-height:1.25;}
+.logo-main{font-family:'Arial Black','Arial',sans-serif;font-size:13px;font-weight:900;letter-spacing:-.5px;background:linear-gradient(135deg,var(--math),var(--soc));-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.logo-sub{font-size:10px;color:var(--muted);letter-spacing:.2px;}
+
+/* Center — Родителям only */
+.nav-center{display:flex;justify-content:center;flex:1;}
+.btn-parents{
+  display:flex;align-items:center;gap:8px;
+  padding:9px 22px;border-radius:999px;
+  border:1px solid var(--border);background:transparent;
+  color:var(--muted);font-family:'Segoe UI','Arial',sans-serif;font-size:13px;font-weight:500;
+  cursor:pointer;transition:all .25s;
+}
+.btn-parents:hover{border-color:rgba(255,255,255,.18);color:var(--text);}
+.btn-parents.active{background:var(--s2);color:var(--text);border-color:rgba(255,255,255,.14);}
+
+/* Profile */
+.profile-btn{position:relative;width:38px;height:38px;border-radius:50%;background:var(--s2);border:1.5px solid var(--border);display:flex;align-items:center;justify-content:center;text-decoration:none;transition:transform .4s cubic-bezier(.34,1.56,.64,1),border-color .25s,box-shadow .25s;flex-shrink:0;}
+.profile-btn svg{width:18px;height:18px;fill:var(--muted);transition:fill .2s;}
+.profile-btn:hover{transform:scale(1.22);border-color:var(--math);box-shadow:0 0 0 4px rgba(0,212,255,.14),0 0 20px rgba(0,212,255,.25);}
+.profile-btn:hover svg{fill:var(--math);}
+.pdot{position:absolute;top:-1px;right:-1px;width:9px;height:9px;border-radius:50%;background:var(--green);border:2px solid var(--bg);opacity:0;transform:scale(0);transition:all .3s;}
+.pdot.on{opacity:1;transform:scale(1);}
+
+/* SPLIT */
+.split{display:grid;grid-template-columns:1fr 1fr;min-height:calc(100vh - 62px);position:relative;}
+@media(max-width:720px){.split{grid-template-columns:1fr;min-height:auto;}}
+.split-line{position:absolute;left:50%;top:8%;bottom:8%;width:1px;background:linear-gradient(transparent,var(--border) 25%,var(--border) 75%,transparent);pointer-events:none;}
+@media(max-width:720px){.split-line{display:none;}}
+
+.half{position:relative;overflow:hidden;padding:64px 52px 72px;display:flex;flex-direction:column;justify-content:flex-end;text-decoration:none;color:inherit;transition:background .4s;}
+@media(max-width:720px){.half{padding:44px 24px 52px;min-height:50vh;}}
+
+.half-m{background:radial-gradient(ellipse 130% 100% at -15% 115%,rgba(0,212,255,.18) 0%,transparent 55%),radial-gradient(ellipse 70% 50% at 105% -5%,rgba(0,136,204,.1) 0%,transparent 50%),var(--bg);border-right:1px solid var(--border);}
+.half-m:hover{background:radial-gradient(ellipse 150% 120% at -15% 115%,rgba(0,212,255,.28) 0%,transparent 55%),radial-gradient(ellipse 70% 50% at 105% -5%,rgba(0,136,204,.16) 0%,transparent 50%),var(--bg);}
+.half-s{background:radial-gradient(ellipse 130% 100% at 115% 115%,rgba(255,170,0,.18) 0%,transparent 55%),radial-gradient(ellipse 70% 50% at -5% -5%,rgba(204,119,0,.1) 0%,transparent 50%),var(--bg);}
+.half-s:hover{background:radial-gradient(ellipse 150% 120% at 115% 115%,rgba(255,170,0,.28) 0%,transparent 55%),radial-gradient(ellipse 70% 50% at -5% -5%,rgba(204,119,0,.16) 0%,transparent 50%),var(--bg);}
+
+.deco{position:absolute;font-family:'Arial Black','Arial',sans-serif;font-weight:900;font-size:clamp(160px,18vw,250px);line-height:1;top:-20px;right:-10px;pointer-events:none;user-select:none;opacity:.04;transition:opacity .4s;}
+.half:hover .deco{opacity:.08;}
+
+/* Tutor chip */
+.chip{position:absolute;top:26px;display:inline-flex;align-items:center;gap:9px;padding:7px 14px 7px 7px;border-radius:999px;background:rgba(255,255,255,.05);border:1px solid var(--border);backdrop-filter:blur(10px);}
+.chip-av{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:'Arial Black','Arial',sans-serif;font-size:9px;font-weight:900;flex-shrink:0;}
+.av-m{background:linear-gradient(135deg,var(--math),#0088cc);color:#000;}
+.av-s{background:linear-gradient(135deg,var(--soc),#cc7700);color:#000;}
+.chip-name{font-size:11px;font-weight:600;}
+.chip-role{font-size:10px;color:var(--muted);}
+
+/* Half content */
+.eyebrow{display:inline-flex;align-items:center;gap:7px;padding:5px 13px;border-radius:999px;font-size:11px;font-weight:600;margin-bottom:14px;width:fit-content;animation:fadeUp .6s .05s ease both;}
+.ey-m{background:rgba(0,212,255,.1);border:1px solid rgba(0,212,255,.22);color:var(--math);}
+.ey-s{background:rgba(255,170,0,.1);border:1px solid rgba(255,170,0,.22);color:var(--soc);}
+.ey-dot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pulse 2s infinite;}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1);}50%{opacity:.3;transform:scale(1.6);}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:none;}}
+
+.htitle{font-family:'Arial Black','Arial',sans-serif;font-size:clamp(28px,3.5vw,50px);font-weight:900;line-height:1.07;letter-spacing:-2px;margin-bottom:10px;animation:fadeUp .65s .1s ease both;}
+/* Fix: use -webkit-text-fill-color only on specific spans, not affecting links */
+.hl-m{background:linear-gradient(135deg,var(--math),#66eeff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.hl-s{background:linear-gradient(135deg,var(--soc),#ffdd66);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+
+.hsub{font-size:13px;color:rgba(238,238,248,.55);line-height:1.78;max-width:360px;margin-bottom:22px;animation:fadeUp .65s .15s ease both;}
+.hstats{display:flex;gap:22px;margin-bottom:24px;animation:fadeUp .65s .2s ease both;}
+.hs-n{font-family:'Arial Black','Arial',sans-serif;font-size:18px;font-weight:800;}
+.hs-l{font-size:10px;color:var(--muted);margin-top:1px;}
+
+.hcta{display:inline-flex;align-items:center;gap:9px;padding:13px 26px;border-radius:999px;font-family:'Segoe UI','Arial',sans-serif;font-size:13px;font-weight:600;border:none;cursor:pointer;text-decoration:none;width:fit-content;transition:transform .3s,box-shadow .3s;animation:fadeUp .65s .25s ease both;}
+.cta-m{background:var(--math);color:#000;box-shadow:0 0 28px rgba(0,212,255,.2);}
+.cta-m:hover{transform:translateY(-3px) scale(1.04);box-shadow:0 0 48px rgba(0,212,255,.45);}
+.cta-s{background:var(--soc);color:#000;box-shadow:0 0 28px rgba(255,170,0,.2);}
+.cta-s:hover{transform:translateY(-3px) scale(1.04);box-shadow:0 0 48px rgba(255,170,0,.45);}
+
+/* PARENTS */
+.par-wrap{display:none;max-width:860px;margin:0 auto;padding:60px 32px 80px;}
+.par-wrap.show{display:block;}
+.par-head{text-align:center;padding-bottom:32px;}
+.par-head h1{font-family:'Arial Black','Arial',sans-serif;font-size:clamp(22px,3vw,36px);font-weight:900;letter-spacing:-2px;margin-bottom:10px;}
+.par-head p{font-size:13px;color:var(--muted);max-width:460px;margin:0 auto 22px;line-height:1.75;}
+.par-tutors{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:22px;}
+@media(max-width:540px){.par-tutors{grid-template-columns:1fr;}}
+.par-tutor{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:20px;display:flex;gap:13px;}
+.pt-av{width:48px;height:48px;border-radius:13px;display:flex;align-items:center;justify-content:center;font-family:'Arial Black','Arial',sans-serif;font-size:14px;font-weight:900;flex-shrink:0;}
+.pt-m{background:linear-gradient(135deg,var(--math),#0088cc);color:#000;}
+.pt-s{background:linear-gradient(135deg,var(--soc),#cc7700);color:#000;}
+.pt-info h4{font-family:'Arial Black','Arial',sans-serif;font-size:12px;font-weight:700;margin-bottom:4px;}
+.pt-info p{font-size:12px;color:var(--muted);line-height:1.6;}
+.par-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px;}
+@media(max-width:540px){.par-grid{grid-template-columns:1fr;}}
+.par-card{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:20px;}
+.par-card h3{font-family:'Arial Black','Arial',sans-serif;font-size:11px;font-weight:700;margin-bottom:6px;}
+.par-card p{font-size:12px;color:var(--muted);line-height:1.7;}
+.par-guarantee{background:linear-gradient(135deg,rgba(0,212,255,.05),rgba(255,170,0,.05));border:1px solid var(--border);border-radius:var(--r);padding:26px;text-align:center;}
+.par-guarantee h3{font-family:'Arial Black','Arial',sans-serif;font-size:14px;font-weight:800;margin-bottom:7px;}
+.par-guarantee p{font-size:12px;color:var(--muted);line-height:1.7;}
+
+@media(max-width:480px){nav{padding:10px 14px;}.logo-text{display:none;}}
+</style>
+</head>
+<body>
+<nav>
+  <a class="nav-logo" href="index.html">
+    <div class="logo-mark">
+      <div class="logo-letters"><span class="la">А</span><span class="lp">П</span></div>
+    </div>
+    <div class="logo-text">
+      <div class="logo-main">ОГЭ Платформа</div>
+      <div class="logo-sub">Пястолов &amp; Максимов</div>
+    </div>
+  </a>
+  <div class="nav-center">
+    <button class="btn-parents" id="parBtn" onclick="togglePar()">👨‍👩‍👧 Родителям</button>
+  </div>
+  <a class="profile-btn" href="cabinet.html" title="Личный кабинет">
+    <div class="pdot" id="pdot"></div>
+    <svg viewBox="0 0 24 24"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/></svg>
+  </a>
+</nav>
+
+<div id="mainSplit">
+  <div class="split">
+    <div class="split-line"></div>
+    <a class="half half-m" href="math.html">
+      <div class="deco" style="color:var(--math)">М</div>
+      <div class="chip" style="left:28px;">
+        <div class="chip-av av-m">АП</div>
+        <div><div class="chip-name">Алексей Пястолов</div><div class="chip-role">Математика</div></div>
+      </div>
+      <div class="eyebrow ey-m"><span class="ey-dot"></span>ОГЭ 2025</div>
+      <h2 class="htitle"><span class="hl-m">Математика</span><br>без страха</h2>
+      <p class="hsub">Красный аттестат, студент. Объясняю на языке школьника. Задачи ФИПИ, разборы, платформа.</p>
+      <div class="hstats">
+        <div><div class="hs-n" style="color:var(--math)">12</div><div class="hs-l">тем</div></div>
+        <div><div class="hs-n" style="color:var(--math)">44+</div><div class="hs-l">задач</div></div>
+        <div><div class="hs-n" style="color:var(--math)">95%</div><div class="hs-l">сдают 4–5</div></div>
+      </div>
+      <span class="hcta cta-m">Перейти к математике →</span>
+    </a>
+    <a class="half half-s" href="social.html">
+      <div class="deco" style="color:var(--soc)">О</div>
+      <div class="chip" style="right:28px;">
+        <div class="chip-av av-s">ДМ</div>
+        <div><div class="chip-name">Дмитрий Максимов</div><div class="chip-role">Обществознание</div></div>
+      </div>
+      <div class="eyebrow ey-s"><span class="ey-dot"></span>ОГЭ 2025</div>
+      <h2 class="htitle"><span class="hl-s">Обществознание</span><br>с нуля</h2>
+      <p class="hsub">Красный диплом, 87 баллов ЕГЭ, РАНХиГС. Структурированный курс, разборы эссе.</p>
+      <div class="hstats">
+        <div><div class="hs-n" style="color:var(--soc)">10</div><div class="hs-l">тем</div></div>
+        <div><div class="hs-n" style="color:var(--soc)">30+</div><div class="hs-l">задач</div></div>
+        <div><div class="hs-n" style="color:var(--soc)">92%</div><div class="hs-l">сдают 4–5</div></div>
+      </div>
+      <span class="hcta cta-s">Перейти к обществознанию →</span>
+    </a>
+  </div>
+</div>
+
+<div class="par-wrap" id="parWrap">
+  <div class="par-head">
+    <h1>Для родителей</h1>
+    <p>Ваш ребёнок готовится к ОГЭ. Прозрачный прогресс, отчёты после каждого урока, гарантия результата.</p>
+    <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
+      <a href="math.html" style="padding:10px 20px;border-radius:999px;background:var(--math);color:#000;font-weight:600;font-size:13px;text-decoration:none;">📐 Математика</a>
+      <a href="social.html" style="padding:10px 20px;border-radius:999px;background:var(--soc);color:#000;font-weight:600;font-size:13px;text-decoration:none;">📚 Обществознание</a>
+    </div>
+  </div>
+  <div class="par-tutors">
+    <div class="par-tutor"><div class="pt-av pt-m">АП</div><div class="pt-info"><h4>Алексей Пястолов</h4><p>Красный аттестат. Студент. Объясняю понятно, пишу родителям после каждого занятия.</p></div></div>
+    <div class="par-tutor"><div class="pt-av pt-s">ДМ</div><div class="pt-info"><h4>Дмитрий Максимов</h4><p>Красный диплом, 87 баллов ЕГЭ, РАНХиГС. Разбираю каждое эссе с подробным комментарием.</p></div></div>
+  </div>
+  <div class="par-grid">
+    <div class="par-card"><h3>📊 Прозрачный прогресс</h3><p>После каждого занятия — краткий отчёт: что разобрали, что получилось, что делать дома.</p></div>
+    <div class="par-card"><h3>📱 Платформа с ДЗ</h3><p>Ребёнок занимается на платформе — вы видите задания и комментарии преподавателя.</p></div>
+    <div class="par-card"><h3>💬 Связь с преподавателем</h3><p>Личные сообщения прямо на платформе. Вопросы, расписание — всё в одном месте.</p></div>
+    <div class="par-card"><h3>🎯 Гарантия результата</h3><p>Нет улучшения за 2 месяца — возвращаем деньги. Первое занятие бесплатно.</p></div>
+  </div>
+  <div class="par-guarantee">
+    <div style="font-size:30px;margin-bottom:10px;">🎓</div>
+    <h3>Первое занятие — бесплатно</h3>
+    <p>Познакомьтесь с преподавателем, оцените подход. Без обязательств.</p>
+  </div>
+</div>
+
+<script>
+  var _SB_URL = 'https://vumpkvjmkgdzleltvwks.supabase.co';
+  var _SB_KEY = 'sb_publishable_rNoVZMRI6CkPJWOYgOEjgQ_V7nh1b2x';
+  (async function(){
+    var supabase = window.supabase.createClient(_SB_URL, _SB_KEY);
+    var r = await supabase.auth.getSession();
+    if (r.data && r.data.session) document.getElementById('pdot').classList.add('on');
+    supabase.auth.onAuthStateChange(function(_,s){ document.getElementById('pdot').classList.toggle('on',!!s); });
+  })();
+</script>
+<script>
+function togglePar(){
+  const w=document.getElementById('parWrap'),m=document.getElementById('mainSplit'),b=document.getElementById('parBtn');
+  const show=!w.classList.contains('show');
+  w.classList.toggle('show',show);
+  m.style.display=show?'none':'block';
+  b.classList.toggle('active',show);
+  if(show)w.scrollIntoView({behavior:'smooth'});
+}
+
+</script>
+</body>
+</html>

@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<script>
+// ╔══════════════════════════════════════════════════════╗
+// ║  Минимальный Supabase клиент — без CDN, чистый fetch ║
+// ║  Покрывает: auth + from().select/insert/update/delete║
+// ╚══════════════════════════════════════════════════════╝
+window.supabase = {
+  createClient: function(url, key) {
+    var base = url.replace(/\/$/, '');
+    var headers = { 'apikey': key, 'Content-Type': 'application/json' };
+
+    // ── Хранение сессии ──
+    var SESSION_KEY = 'sb_session';
+    var _session = null;
+    var _authListeners = [];
+
+    function saveSession(s) {
+      _session = s;
+      try { localStorage.setItem(SESSION_KEY, JSON.stringify(s)); } catch(e){}
+      _authListeners.forEach(function(fn){ fn('SIGNED_IN', s); });
+    }
+    function clearSession() {
+      _session = null;
+      try { localStorage.removeItem(SESSION_KEY); } catch(e){}
+      _authListeners.forEach(function(fn){ fn('SIGNED_OUT', null); });
+    }
+    function loadSession() {
+      if (_session) return _session;
+      try {
+        var raw = localStorage.getItem(SESSION_KEY);
+        if (raw) { _session = JSON.parse(raw); return _session; }
+      } catch(e){}
+      return null;
+    }
+
+    // ── AUTH ──
+    var auth = {
+      getSession: async function() {
+        var s = loadSession();
+        // Refresh if expired
+        if (s && s.expires_at && Date.now() / 1000 > s.expires_at - 60) {
+          try {
+            var r = await fetch(base + '/auth/v1/token?grant_type=refresh_token', {
+              method: 'POST',
+              headers: headers,
+              body: JSON.stringify({ refresh_token: s.refresh_token })
+            });
+            var d = await r.json();
+            if (d.access_token) {
+              s = { access_token: d.access_token, refresh_token: d.refresh_token,
+                    expires_at: Math.floor(Date.now()/1000) + (d.expires_in||3600), user: d.user };
+              saveSession(s);
+            } else { clearSession(); return { data: { session: null }, error: null }; }
+          } catch(e) { return { data: { session: loadSession() }, error: null }; }
+        }
+        return { data: { session: s }, error: null };
+      },
+
+      onAuthStateChange: function(callback) {
+        _authListeners.push(callback);
+        // Fire immediately with current state
+        var s = loadSession();
+        if (s) setTimeout(function(){ callback('SIGNED_IN', s); }, 0);
+        return { data: { subscription: { unsubscribe: function(){
+          _authListeners = _authListeners.filter(function(f){ return f !== callback; });
+        }}}};
+      },
+
+      signInWithPassword: async function(opts) {
+        try {
+          var r = await fetch(base + '/auth/v1/token?grant_type=password', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ email: opts.email, password: opts.password })
+          });
+          var d = await r.json();
+          if (d.error || d.error_description || d.msg) {
+            var msg = d.error_description || d.msg || d.error || 'Ошибка входа';
+            if (msg.includes('Invalid login')) msg = 'Invalid login credentials';
+            return { data: null, error: { message: msg } };
+          }
+          var s = { access_token: d.access_token, refresh_token: d.refresh_token,
+                    expires_at: Math.floor(Date.now()/1000) + (d.expires_in||3600), user: d.user };
+          saveSession(s);
+          return { data: { session: s, user: d.user }, error: null };
+        } catch(e) { return { data: null, error: { message: e.message } }; }
+      },
+
+      signUp: async function(opts) {
+        try {
+          var r = await fetch(base + '/auth/v1/signup', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ email: opts.email, password: opts.password,
+                                   data: (opts.options && opts.options.data) || {} })
+          });
+          var d = await r.json();
+          if (d.error || d.error_description) {
+            return { data: null, error: { message: d.error_description || d.error } };
+          }
+          // Auto-login after signup
+          var s = null;
+          if (d.access_token) {
+            s = { access_token: d.access_token, refresh_token: d.refresh_token,
+                  expires_at: Math.floor(Date.now()/1000) + (d.expires_in||3600), user: d.user };
+            saveSession(s);
+          }
+          return { data: { session: s, user: d.user || d }, error: null };
+        } catch(e) { return { data: null, error: { message: e.message } }; }
+      },
+
+      signOut: async function() {
+        var s = loadSession();
+        if (s) {
+          try {
+            await fetch(base + '/auth/v1/logout', {
+              method: 'POST',
+              headers: Object.assign({}, headers, { 'Authorization': 'Bearer ' + s.access_token })
+            });
+          } catch(e){}
+        }
+        clearSession();
+        return { error: null };
+      }
+    };
+
+    // ── DATABASE (PostgREST) ──
+    function from(table) {
+      var _filters = [];
+      var _select = '*';
+      var _order = null;
+      var _limit = null;
+
+      function getAuthHeader() {
+        var s = loadSession();
+        if (s && s.access_token) return { 'Authorization': 'Bearer ' + s.access_token };
+        return {};
+      }
+
+      function buildUrl() {
+        var u = base + '/rest/v1/' + table + '?select=' + _select;
+        _filters.forEach(function(f){ u += '&' + f; });
+        if (_order) u += '&order=' + _order;
+        if (_limit) u += '&limit=' + _limit;
+        return u;
+      }
+
+      var q = {
+        select: function(cols) { _select = cols || '*'; return q; },
+        eq:     function(col, val) { _filters.push(col + '=eq.' + encodeURIComponent(val)); return q; },
+        neq:    function(col, val) { _filters.push(col + '=neq.' + encodeURIComponent(val)); return q; },
+        or:     function(expr) { _filters.push('or=(' + expr + ')'); return q; },
+        order:  function(col, opts) {
+          _order = col + (opts && opts.ascending === false ? '.desc' : '.asc');
+          return q;
+        },
+        limit:  function(n) { _limit = n; return q; },
+
+        // Execute SELECT
+        then: function(resolve, reject) {
+          return fetch(buildUrl(), {
+            headers: Object.assign({}, headers, getAuthHeader(),
+                       { 'Prefer': 'return=representation' })
+          })
+          .then(function(r){ return r.json(); })
+          .then(function(d){
+            if (d && d.code && d.message) resolve({ data: null, error: { message: d.message } });
+            else resolve({ data: Array.isArray(d) ? d : [], error: null });
+          })
+          .catch(function(e){ resolve({ data: null, error: { message: e.message } }); });
+        },
+
+        insert: async function(rows) {
+          try {
+            var body = Array.isArray(rows) ? rows : [rows];
+            var r = await fetch(base + '/rest/v1/' + table, {
+              method: 'POST',
+              headers: Object.assign({}, headers, getAuthHeader(), { 'Prefer': 'return=representation' }),
+              body: JSON.stringify(body)
+            });
+            var d = await r.json();
+            if (d && d.code) return { data: null, error: { message: d.message || d.details } };
+            return { data: Array.isArray(d) ? d : [d], error: null };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        upsert: async function(rows) {
+          try {
+            var body = Array.isArray(rows) ? rows : [rows];
+            var r = await fetch(base + '/rest/v1/' + table, {
+              method: 'POST',
+              headers: Object.assign({}, headers, getAuthHeader(),
+                         { 'Prefer': 'return=representation,resolution=merge-duplicates' }),
+              body: JSON.stringify(body)
+            });
+            var d = await r.json();
+            if (d && d.code) return { data: null, error: { message: d.message } };
+            return { data: d, error: null };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        update: async function(vals) {
+          try {
+            var u = base + '/rest/v1/' + table + '?';
+            _filters.forEach(function(f, i){ u += (i?'&':'') + f; });
+            var r = await fetch(u, {
+              method: 'PATCH',
+              headers: Object.assign({}, headers, getAuthHeader(), { 'Prefer': 'return=representation' }),
+              body: JSON.stringify(vals)
+            });
+            var d = await r.json();
+            if (d && d.code) return { data: null, error: { message: d.message } };
+            return { data: d, error: null };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        delete: async function() {
+          try {
+            var u = base + '/rest/v1/' + table + '?';
+            _filters.forEach(function(f, i){ u += (i?'&':'') + f; });
+            var r = await fetch(u, {
+              method: 'DELETE',
+              headers: Object.assign({}, headers, getAuthHeader())
+            });
+            return { data: null, error: r.ok ? null : { message: 'Delete failed' } };
+          } catch(e) { return { data: null, error: { message: e.message } }; }
+        },
+
+        filter: function(col, op, val) { _filters.push(col + '=' + op + '.' + encodeURIComponent(val)); return q; }
+      };
+      return q;
+    }
+
+    return { auth: auth, from: from };
+  }
+};
+
+</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Личный кабинет — ОГЭ Платформа</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#080810">
+
+
+<!-- ╔══════════════════════════════════════════════════════╗
+     ║  Supabase — локальный файл supabase.js              ║
+     ╚══════════════════════════════════════════════════════╝ -->
+
+<style>
+:root{--bg:#080810;--s1:#0f0f1c;--s2:#181828;--s3:#22223a;--math:#00d4ff;--soc:#ffaa00;--pink:#ff3377;--green:#00e5a0;--text:#eeeef8;--muted:#5a5a88;--border:rgba(255,255,255,.07);--r:16px;}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Segoe UI','Arial',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
+body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");opacity:.5;}
+
+nav{position:sticky;top:0;z-index:200;display:flex;align-items:center;justify-content:space-between;padding:11px 28px;background:rgba(8,8,16,.95);backdrop-filter:blur(24px);border-bottom:1px solid var(--border);gap:12px;}
+.nav-logo{display:flex;align-items:center;gap:10px;text-decoration:none;}
+.logo-mark{width:38px;height:38px;border-radius:11px;background:var(--s2);border:1.5px solid var(--border);display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;transition:transform .5s cubic-bezier(.34,1.56,.64,1),border-color .3s,box-shadow .3s;}
+.logo-mark::before{content:'';position:absolute;inset:-50%;width:200%;height:200%;background:conic-gradient(from 0deg,var(--math),var(--soc),var(--pink),var(--math));opacity:0;transition:opacity .4s;}
+.nav-logo:hover .logo-mark{transform:rotate(-8deg) scale(1.18);border-color:var(--math);box-shadow:0 0 0 3px rgba(0,212,255,.18),0 0 24px rgba(0,212,255,.3);}
+.nav-logo:hover .logo-mark::before{opacity:.25;animation:logospin 3s linear infinite;}
+@keyframes logospin{to{transform:rotate(360deg);}}
+.logo-letters{position:relative;z-index:2;font-family:'Arial Black','Arial',sans-serif;font-size:12px;font-weight:900;display:flex;gap:1px;}
+.la{color:var(--math);}.lp{color:var(--soc);}
+.logo-name{font-family:'Arial Black','Arial',sans-serif;font-size:12px;font-weight:700;background:linear-gradient(135deg,var(--math),var(--soc));-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.nav-back{padding:7px 14px;border-radius:999px;border:1px solid var(--border);background:transparent;color:var(--muted);font-family:'Segoe UI','Arial',sans-serif;font-size:12px;cursor:pointer;text-decoration:none;transition:all .2s;}
+.nav-back:hover{border-color:var(--math);color:var(--math);}
+
+/* AUTH */
+.auth-wrap{display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 58px);padding:32px 20px;}
+.auth-card{background:var(--s1);border:1px solid var(--border);border-radius:22px;padding:38px;width:100%;max-width:390px;animation:fadeUp .4s ease both;}
+@keyframes fadeUp{from{opacity:0;transform:translateY(18px);}to{opacity:1;transform:none;}}
+.auth-head{text-align:center;margin-bottom:26px;}
+.auth-logo{width:54px;height:54px;border-radius:16px;background:var(--s2);border:1.5px solid var(--border);display:flex;align-items:center;justify-content:center;margin:0 auto 14px;font-family:'Arial Black','Arial',sans-serif;font-size:16px;font-weight:900;}
+.auth-title{font-family:'Arial Black','Arial',sans-serif;font-size:19px;font-weight:900;letter-spacing:-1px;margin-bottom:4px;}
+.auth-sub{font-size:13px;color:var(--muted);}
+
+.seg{display:grid;grid-template-columns:1fr 1fr;gap:5px;background:var(--s2);border-radius:11px;padding:4px;margin-bottom:22px;}
+.seg-btn{padding:9px;border-radius:8px;border:none;background:transparent;color:var(--muted);font-family:'Segoe UI','Arial',sans-serif;font-size:13px;cursor:pointer;transition:all .2s;}
+.seg-btn.on{background:var(--s3);color:var(--text);}
+
+.fgroup{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;}
+.flabel{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;}
+.finput{padding:11px 14px;border-radius:11px;background:var(--s2);border:1px solid var(--border);color:var(--text);font-family:'Segoe UI','Arial',sans-serif;font-size:14px;outline:none;transition:border-color .2s,box-shadow .2s;width:100%;}
+.finput:focus{border-color:var(--math);box-shadow:0 0 0 3px rgba(0,212,255,.1);}
+select.finput{cursor:pointer;}
+
+.btn-auth{width:100%;padding:13px;border-radius:999px;background:linear-gradient(135deg,var(--math),#0099dd);color:#000;font-family:'Segoe UI','Arial',sans-serif;font-size:14px;font-weight:700;border:none;cursor:pointer;margin-top:4px;transition:all .25s;}
+.btn-auth:hover{transform:translateY(-2px);box-shadow:0 0 36px rgba(0,212,255,.35);}
+.btn-auth:disabled{opacity:.6;cursor:default;transform:none;}
+
+.auth-err{padding:10px 13px;border-radius:10px;background:rgba(255,51,119,.08);border:1px solid rgba(255,51,119,.22);color:var(--pink);font-size:12px;margin-bottom:12px;display:none;line-height:1.5;}
+.auth-err.on{display:block;}
+.auth-ok{padding:10px 13px;border-radius:10px;background:rgba(0,229,160,.08);border:1px solid rgba(0,229,160,.22);color:var(--green);font-size:12px;margin-bottom:12px;display:none;}
+.auth-ok.on{display:block;}
+
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(0,0,0,.3);border-top-color:#000;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+/* CABINET */
+.cab{max-width:920px;margin:0 auto;padding:0 28px 80px;display:none;}
+.cab.on{display:block;}
+.profile-bar{display:flex;align-items:center;gap:18px;padding:34px 0 26px;}
+.pav{width:62px;height:62px;border-radius:18px;background:linear-gradient(135deg,var(--math),var(--soc));display:flex;align-items:center;justify-content:center;font-family:'Arial Black','Arial',sans-serif;font-size:22px;font-weight:900;color:#000;flex-shrink:0;}
+.pinfo h2{font-family:'Arial Black','Arial',sans-serif;font-size:17px;font-weight:900;letter-spacing:-1px;margin-bottom:3px;}
+.pinfo p{font-size:13px;color:var(--muted);}
+.mod-badge{display:inline-flex;align-items:center;gap:5px;padding:4px 11px;border-radius:999px;background:rgba(255,170,0,.1);border:1px solid rgba(255,170,0,.22);color:var(--soc);font-size:11px;font-weight:600;margin-top:5px;}
+.stu-badge{display:inline-flex;align-items:center;gap:5px;padding:4px 11px;border-radius:999px;background:rgba(0,212,255,.08);border:1px solid rgba(0,212,255,.2);color:var(--math);font-size:11px;font-weight:600;margin-top:5px;}
+
+.stabs{display:flex;gap:7px;margin-bottom:20px;}
+.stab{padding:8px 18px;border-radius:999px;border:1.5px solid var(--border);background:transparent;color:var(--muted);font-family:'Segoe UI','Arial',sans-serif;font-size:13px;cursor:pointer;transition:all .25s;}
+.stab.m.on{border-color:var(--math);color:var(--math);background:rgba(0,212,255,.08);}
+.stab.s.on{border-color:var(--soc);color:var(--soc);background:rgba(255,170,0,.08);}
+
+.mtabs{display:flex;gap:5px;margin-bottom:20px;flex-wrap:wrap;}
+.mtab{padding:8px 16px;border-radius:999px;border:1px solid var(--border);background:transparent;color:var(--muted);font-family:'Segoe UI','Arial',sans-serif;font-size:12px;cursor:pointer;transition:all .2s;}
+.mtab.on{background:var(--s2);color:var(--text);border-color:rgba(255,255,255,.14);}
+
+.tcontent{display:none;}.tcontent.on{display:block;}
+
+.stat-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:11px;margin-bottom:22px;}
+@media(max-width:500px){.stat-grid{grid-template-columns:1fr;}}
+.stat-c{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:17px;}
+.stat-n{font-family:'Arial Black','Arial',sans-serif;font-size:26px;font-weight:800;}
+.stat-l{font-size:11px;color:var(--muted);margin-top:2px;}
+
+.sub-card{background:var(--s2);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:9px;}
+.sub-meta{font-size:11px;color:var(--muted);margin-bottom:6px;}
+.sub-text{font-size:13px;line-height:1.65;margin-bottom:10px;color:var(--text);}
+.sub-comment{padding:9px 12px;border-radius:9px;background:rgba(0,212,255,.07);border:1px solid rgba(0,212,255,.15);font-size:12px;color:var(--math);}
+
+.hw-list{display:grid;gap:9px;}
+.hw-c{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:15px;display:flex;align-items:center;gap:13px;}
+.hw-ico{width:40px;height:40px;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:17px;flex-shrink:0;}
+.hw-body{flex:1;}
+.hw-t{font-weight:600;font-size:13px;margin-bottom:2px;color:var(--text);}
+.hw-m{font-size:11px;color:var(--muted);}
+.hw-st{padding:4px 10px;border-radius:999px;font-size:10px;font-weight:600;white-space:nowrap;}
+.st-n{background:rgba(0,212,255,.1);color:var(--math);}
+.st-d{background:rgba(0,229,160,.1);color:var(--green);}
+
+.chat-box{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;display:flex;flex-direction:column;height:480px;}
+.chat-hd{padding:13px 17px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;background:var(--s2);}
+.chat-av{width:32px;height:32px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-family:'Arial Black','Arial',sans-serif;font-size:10px;font-weight:900;flex-shrink:0;}
+.chat-msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:9px;}
+.chat-msgs::-webkit-scrollbar{width:3px;}
+.chat-msgs::-webkit-scrollbar-thumb{background:var(--s3);border-radius:2px;}
+.msg{max-width:70%;padding:9px 13px;border-radius:13px;font-size:13px;line-height:1.55;color:var(--text);}
+.msg.me{align-self:flex-end;background:rgba(0,212,255,.14);border:1px solid rgba(0,212,255,.18);}
+.msg.them{align-self:flex-start;background:var(--s2);border:1px solid var(--border);}
+.msg-time{font-size:10px;color:var(--muted);margin-top:3px;text-align:right;}
+.chat-inp-row{padding:11px 14px;border-top:1px solid var(--border);display:flex;gap:8px;}
+.chat-inp{flex:1;padding:10px 13px;border-radius:10px;background:var(--s2);border:1px solid var(--border);color:var(--text);font-family:'Segoe UI','Arial',sans-serif;font-size:13px;outline:none;transition:border-color .2s;}
+.chat-inp:focus{border-color:var(--math);}
+.chat-send{padding:10px 17px;border-radius:10px;background:var(--math);color:#000;font-size:12px;font-weight:600;border:none;cursor:pointer;white-space:nowrap;}
+
+.mod-panel{background:var(--s1);border:1px solid rgba(255,170,0,.2);border-radius:18px;padding:24px;margin-bottom:20px;}
+.mod-tabs{display:flex;gap:5px;margin-bottom:18px;flex-wrap:wrap;}
+.mod-tab{padding:7px 14px;border-radius:999px;border:1px solid var(--border);background:transparent;color:var(--muted);font-family:'Segoe UI','Arial',sans-serif;font-size:12px;cursor:pointer;transition:all .2s;}
+.mod-tab.on{background:rgba(255,170,0,.09);border-color:rgba(255,170,0,.3);color:var(--soc);}
+.modcontent{display:none;}.modcontent.on{display:block;}
+
+.type-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px;}
+.ttype{padding:11px;border-radius:11px;border:1.5px solid var(--border);background:var(--s2);color:var(--muted);font-family:'Segoe UI','Arial',sans-serif;font-size:13px;cursor:pointer;text-align:center;transition:all .25s;}
+.ttype span{display:block;font-size:19px;margin-bottom:3px;}
+.ttype.on{border-color:var(--math);color:var(--math);background:rgba(0,212,255,.07);}
+
+.opt-builder{display:flex;flex-direction:column;gap:7px;margin:9px 0;}
+.opt-row{display:flex;gap:7px;}
+.opt-row .finput{flex:1;}
+.rm-opt{width:30px;height:30px;border-radius:8px;background:rgba(255,51,119,.08);border:1px solid rgba(255,51,119,.2);color:var(--pink);cursor:pointer;font-size:13px;flex-shrink:0;transition:all .2s;}
+.add-opt{padding:7px 13px;border-radius:9px;background:var(--s3);border:1px dashed var(--border);color:var(--muted);font-size:12px;cursor:pointer;transition:all .2s;}
+.add-opt:hover{border-color:var(--math);color:var(--math);}
+
+.btn-upload{padding:11px 22px;border-radius:999px;background:linear-gradient(135deg,var(--math),#0099dd);color:#000;font-family:'Segoe UI','Arial',sans-serif;font-size:13px;font-weight:700;border:none;cursor:pointer;transition:all .25s;margin-top:6px;}
+.btn-upload:hover{transform:translateY(-2px);box-shadow:0 0 32px rgba(0,212,255,.3);}
+.check-card{background:var(--s2);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:9px;}
+.comment-row{display:flex;gap:7px;margin-top:10px;}
+.comment-inp{flex:1;padding:9px 12px;border-radius:9px;background:var(--s1);border:1px solid var(--border);color:var(--text);font-family:'Segoe UI','Arial',sans-serif;font-size:13px;outline:none;}
+.comment-ok{padding:9px 15px;border-radius:9px;background:var(--green);color:#000;font-size:12px;font-weight:600;border:none;cursor:pointer;white-space:nowrap;}
+.hw-compose{background:var(--s2);border-radius:13px;padding:18px;}
+.btn-hw{padding:11px 22px;border-radius:999px;background:linear-gradient(135deg,var(--soc),#ff8800);color:#000;font-family:'Segoe UI','Arial',sans-serif;font-size:13px;font-weight:700;border:none;cursor:pointer;transition:all .25s;margin-top:6px;}
+.btn-hw:hover{transform:translateY(-2px);}
+
+.logout-btn{padding:9px 20px;border-radius:999px;background:rgba(255,51,119,.07);border:1px solid rgba(255,51,119,.18);color:var(--pink);font-family:'Segoe UI','Arial',sans-serif;font-size:13px;cursor:pointer;transition:all .2s;margin-top:28px;display:inline-block;}
+.logout-btn:hover{background:rgba(255,51,119,.14);}
+
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(16px);z-index:2000;padding:11px 20px;border-radius:11px;background:var(--s2);border:1px solid var(--border);font-size:13px;opacity:0;transition:all .3s;pointer-events:none;white-space:nowrap;}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+.toast.ok{border-color:rgba(0,229,160,.3);color:var(--green);}
+.toast.err{border-color:rgba(255,51,119,.3);color:var(--pink);}
+
+@media(max-width:580px){nav{padding:9px 14px;}.cab{padding:0 14px 60px;}}
+</style>
+</head>
+<body>
+<nav>
+  <a class="nav-logo" href="index.html">
+    <div class="logo-mark">
+      <div class="logo-letters"><span class="la">А</span><span class="lp">П</span></div>
+    </div>
+    <span class="logo-name">ОГЭ Платформа</span>
+  </a>
+  <a class="nav-back" href="index.html">← На главную</a>
+</nav>
+
+<!-- AUTH -->
+<div class="auth-wrap" id="authWrap">
+  <div class="auth-card">
+    <div class="auth-head">
+      <div class="auth-logo"><span class="la">А</span><span class="lp">П</span></div>
+      <div class="auth-title">Личный кабинет</div>
+      <div class="auth-sub">Войдите или создайте аккаунт</div>
+    </div>
+
+    <!-- Переключатель -->
+    <div class="seg">
+      <button class="seg-btn on" id="btnLogin" onclick="swForm('login')">Войти</button>
+      <button class="seg-btn"    id="btnReg"   onclick="swForm('reg')">Регистрация</button>
+    </div>
+
+    <div class="auth-err" id="authErr"></div>
+    <div class="auth-ok"  id="authOk"></div>
+
+    <!-- Форма входа -->
+    <div id="fLogin">
+      <div class="fgroup">
+        <label class="flabel">Email</label>
+        <input class="finput" id="lEmail" type="email" placeholder="your@email.com" autocomplete="email">
+      </div>
+      <div class="fgroup">
+        <label class="flabel">Пароль</label>
+        <input class="finput" id="lPass" type="password" placeholder="••••••••" autocomplete="current-password">
+      </div>
+      <button class="btn-auth" id="btnDoLogin" onclick="doLogin()">Войти →</button>
+    </div>
+
+    <!-- Форма регистрации -->
+    <div id="fReg" style="display:none">
+      <div class="fgroup">
+        <label class="flabel">Ваше имя</label>
+        <input class="finput" id="rName" type="text" placeholder="Иван Петров" autocomplete="name">
+      </div>
+      <div class="fgroup">
+        <label class="flabel">Email</label>
+        <input class="finput" id="rEmail" type="email" placeholder="your@email.com" autocomplete="email">
+      </div>
+      <div class="fgroup">
+        <label class="flabel">Пароль (мин. 6 символов)</label>
+        <input class="finput" id="rPass" type="password" placeholder="••••••••" autocomplete="new-password">
+      </div>
+      <button class="btn-auth" id="btnDoReg" onclick="doReg()">Создать аккаунт →</button>
+    </div>
+  </div>
+</div>
+
+<!-- КАБИНЕТ -->
+<div class="cab" id="cab">
+  <div class="profile-bar">
+    <div class="pav" id="pAv">?</div>
+    <div class="pinfo">
+      <h2 id="pName">—</h2>
+      <p id="pEmail">—</p>
+      <div id="pBadge"></div>
+    </div>
+  </div>
+
+  <div class="stabs">
+    <button class="stab m on" onclick="setSub('math',this)">📐 Математика</button>
+    <button class="stab s"    onclick="setSub('social',this)">📚 Обществознание</button>
+  </div>
+
+  <div class="mtabs">
+    <button class="mtab on" onclick="setTab('prog',this)">📊 Прогресс</button>
+    <button class="mtab"    onclick="setTab('hw',this)">📝 ДЗ</button>
+    <button class="mtab"    onclick="setTab('chat',this)">💬 Чат с тренером</button>
+    <button class="mtab" id="modBtn" style="display:none" onclick="setTab('mod',this)">⚙️ Панель тренера</button>
+  </div>
+
+  <!-- Прогресс -->
+  <div class="tcontent on" id="tab-prog">
+    <div class="stat-grid">
+      <div class="stat-c"><div class="stat-n" id="stSolved" style="color:var(--math)">0</div><div class="stat-l">Решено задач</div></div>
+      <div class="stat-c"><div class="stat-n" id="stSubs" style="color:var(--soc)">0</div><div class="stat-l">Работ на проверке</div></div>
+    </div>
+    <div style="font-family:'Arial Black','Arial',sans-serif;font-size:14px;font-weight:700;margin-bottom:13px;">Мои работы</div>
+    <div id="mySubs"><div style="color:var(--muted);font-size:13px;">Загрузка...</div></div>
+  </div>
+
+  <!-- ДЗ -->
+  <div class="tcontent" id="tab-hw">
+    <div class="hw-list" id="hwList"><div style="color:var(--muted);font-size:13px;">Загрузка...</div></div>
+  </div>
+
+  <!-- Чат -->
+  <div class="tcontent" id="tab-chat">
+    <div class="chat-box">
+      <div class="chat-hd">
+        <div class="chat-av" id="chatAv" style="background:var(--s3)">?</div>
+        <div>
+          <div style="font-size:13px;font-weight:600;" id="chatName">Тренер</div>
+          <div style="font-size:11px;color:var(--muted);" id="chatRole"></div>
+        </div>
+      </div>
+      <div class="chat-msgs" id="chatMsgs">
+        <div style="color:var(--muted);font-size:13px;text-align:center;padding:20px;">Напишите первое сообщение 👋</div>
+      </div>
+      <div class="chat-inp-row">
+        <input class="chat-inp" id="chatInp" placeholder="Сообщение...">
+        <button class="chat-send" onclick="sendMsg()">Отправить</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Панель тренера -->
+  <div class="tcontent" id="tab-mod">
+    <div class="mod-panel">
+      <div style="font-family:'Arial Black','Arial',sans-serif;font-size:15px;font-weight:800;margin-bottom:4px;">Панель преподавателя</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:18px;">Загрузка заданий, проверка работ, отправка ДЗ</div>
+      <div class="mod-tabs">
+        <button class="mod-tab on" onclick="setModTab('upload',this)">📤 Задание</button>
+        <button class="mod-tab"    onclick="setModTab('check',this)">📋 Проверка</button>
+        <button class="mod-tab"    onclick="setModTab('sendhw',this)">📝 ДЗ</button>
+        <button class="mod-tab"    onclick="setModTab('mytasks',this)">📦 Мои</button>
+      </div>
+
+      <div class="modcontent on" id="mod-upload">
+        <div class="type-row">
+          <button class="ttype on" id="ttest" onclick="setTaskType('test')"><span>☑️</span>Тест</button>
+          <button class="ttype"    id="text"  onclick="setTaskType('extended')"><span>✍️</span>Развёрнутый</button>
+        </div>
+        <div class="fgroup"><label class="flabel">Предмет</label><select class="finput" id="uSubj"><option value="math">📐 Математика</option><option value="social">📚 Обществознание</option></select></div>
+        <div class="fgroup"><label class="flabel">Тема</label><input class="finput" id="uTopic" placeholder="например: Уравнения"></div>
+        <div class="fgroup"><label class="flabel">Номер/название</label><input class="finput" id="uNum" placeholder="Задание №5"></div>
+        <div class="fgroup"><label class="flabel">Сложность</label><select class="finput" id="uDiff"><option value="easy">Лёгкое</option><option value="mid" selected>Среднее</option><option value="hard">Сложное</option></select></div>
+        <div class="fgroup"><label class="flabel">Текст задания</label><textarea class="finput" id="uQ" style="resize:vertical;min-height:80px" placeholder="Условие..."></textarea></div>
+        <div id="optSec">
+          <div class="fgroup"><label class="flabel">Варианты ответов</label>
+            <div class="opt-builder" id="optBuilder">
+              <div class="opt-row"><input class="finput" placeholder="Вариант А..."><button class="rm-opt" onclick="rmOpt(this)">✕</button></div>
+              <div class="opt-row"><input class="finput" placeholder="Вариант Б..."><button class="rm-opt" onclick="rmOpt(this)">✕</button></div>
+            </div>
+            <button class="add-opt" onclick="addOpt()">+ Добавить вариант</button>
+          </div>
+          <div class="fgroup"><label class="flabel">Правильный ответ (точно)</label><input class="finput" id="uAns" placeholder="Вариант А..."></div>
+        </div>
+        <div id="extSec" style="display:none">
+          <div class="fgroup"><label class="flabel">Эталонный ответ</label><textarea class="finput" id="uAnsExt" style="resize:vertical;min-height:70px" placeholder="Образцовый ответ..."></textarea></div>
+        </div>
+        <div class="fgroup"><label class="flabel">Разбор</label><textarea class="finput" id="uExpl" style="resize:vertical;min-height:70px" placeholder="Пояснение..."></textarea></div>
+        <button class="btn-upload" onclick="uploadTask()">📤 Опубликовать задание</button>
+      </div>
+
+      <div class="modcontent" id="mod-check">
+        <div id="subsList"><div style="color:var(--muted);font-size:13px;">Загрузка...</div></div>
+      </div>
+
+      <div class="modcontent" id="mod-sendhw">
+        <div class="hw-compose">
+          <div class="fgroup"><label class="flabel">Предмет</label><select class="finput" id="hwSubj"><option value="math">📐 Математика</option><option value="social">📚 Обществознание</option></select></div>
+          <div class="fgroup"><label class="flabel">Название ДЗ</label><input class="finput" id="hwTitle" placeholder="Уравнения — вариант №3"></div>
+          <div class="fgroup"><label class="flabel">Описание</label><textarea class="finput" id="hwDesc" style="resize:vertical;min-height:70px" placeholder="Что нужно сделать..."></textarea></div>
+          <div class="fgroup"><label class="flabel">Срок сдачи</label><input class="finput" id="hwDl" type="datetime-local"></div>
+          <button class="btn-hw" onclick="sendHw()">📝 Отправить всем ученикам</button>
+        </div>
+      </div>
+
+      <div class="modcontent" id="mod-mytasks">
+        <div id="myTasksList"><div style="color:var(--muted);font-size:13px;">Загрузка...</div></div>
+      </div>
+    </div>
+  </div>
+
+  <button class="logout-btn" onclick="doLogout()">Выйти из аккаунта</button>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     СКРИПТ — обычный (не module), все функции глобальные
+     ═══════════════════════════════════════════════════════════ -->
+<script>
+// ╔══════════════════════════════════════════════════════╗
+// ║  КЛЮЧИ SUPABASE:                                     ║
+var SB_URL  = 'https://vumpkvjmkgdzleltvwks.supabase.co';      // https://xxxx.supabase.co
+var SB_KEY  = 'sb_publishable_rNoVZMRI6CkPJWOYgOEjgQ_V7nh1b2x';  // sb_publishable_...
+var MOD_EMAILS = ['13pyastolov05@mail.ru', 'dmitry@example.com']; // ваши emails
+// ╚══════════════════════════════════════════════════════╝
+
+// Инициализация Supabase (локальный файл)
+var supabase = window.supabase.createClient(SB_URL, SB_KEY);
+var me = null;
+var curSubj = 'math';
+var taskType = 'test';
+
+function isMod(email) {
+  return MOD_EMAILS.includes((email || '').toLowerCase().trim());
+}
+
+// ── TOAST ──
+function toast(msg, type) {
+  type = type || 'ok';
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + type;
+  setTimeout(function(){ t.className = 'toast'; }, 3000);
+}
+
+// ── ПЕРЕКЛЮЧЕНИЕ ФОРМ ──
+function swForm(f) {
+  document.getElementById('fLogin').style.display = f === 'login' ? 'block' : 'none';
+  document.getElementById('fReg').style.display   = f === 'reg'   ? 'block' : 'none';
+  document.getElementById('btnLogin').classList.toggle('on', f === 'login');
+  document.getElementById('btnReg').classList.toggle('on',   f === 'reg');
+  document.getElementById('authErr').classList.remove('on');
+  document.getElementById('authOk').classList.remove('on');
+}
+
+function showErr(msg) {
+  var e = document.getElementById('authErr');
+  e.textContent = msg;
+  e.classList.add('on');
+  document.getElementById('authOk').classList.remove('on');
+}
+function showOk(msg) {
+  var e = document.getElementById('authOk');
+  e.textContent = msg;
+  e.classList.add('on');
+  document.getElementById('authErr').classList.remove('on');
+}
+
+// ── ВХОД ──
+async function doLogin() {
+  var email = document.getElementById('lEmail').value.trim();
+  var pass  = document.getElementById('lPass').value;
+  if (!email || !pass) return showErr('Заполните email и пароль');
+  var btn = document.getElementById('btnDoLogin');
+  btn.disabled = true;
+  btn.textContent = 'Входим...';
+  var result = await supabase.auth.signInWithPassword({ email: email, password: pass });
+  btn.disabled = false;
+  btn.textContent = 'Войти →';
+  if (result.error) {
+    var msgs = {
+      'Invalid login credentials': 'Неверный email или пароль',
+      'Email not confirmed': 'Подтвердите email (проверьте почту)'
+    };
+    showErr(msgs[result.error.message] || result.error.message);
+  }
+}
+
+// ── РЕГИСТРАЦИЯ ──
+async function doReg() {
+  var name  = document.getElementById('rName').value.trim();
+  var email = document.getElementById('rEmail').value.trim();
+  var pass  = document.getElementById('rPass').value;
+  if (!name || !email || !pass) return showErr('Заполните все поля');
+  if (pass.length < 6) return showErr('Пароль минимум 6 символов');
+  var btn = document.getElementById('btnDoReg');
+  btn.disabled = true;
+  btn.textContent = 'Создаём...';
+  var result = await supabase.auth.signUp({
+    email: email,
+    password: pass,
+    options: { data: { name: name } }
+  });
+  btn.disabled = false;
+  btn.textContent = 'Создать аккаунт →';
+  if (result.error) return showErr(result.error.message);
+  if (result.data && result.data.user) {
+    await supabase.from('profiles').upsert({
+      id: result.data.user.id,
+      name: name,
+      email: email,
+      role: isMod(email) ? 'moderator' : 'student'
+    });
+  }
+  showOk('✓ Аккаунт создан! Добро пожаловать.');
+}
+
+// ── ВЫХОД ──
+async function doLogout() {
+  await supabase.auth.signOut();
+  me = null;
+  document.getElementById('cab').classList.remove('on');
+  document.getElementById('authWrap').style.display = 'flex';
+}
+
+// ── ПОКАЗАТЬ КАБИНЕТ ──
+async function showCab(user) {
+  me = user;
+  document.getElementById('authWrap').style.display = 'none';
+  document.getElementById('cab').classList.add('on');
+  var name = (user.user_metadata && user.user_metadata.name) || user.email.split('@')[0];
+  document.getElementById('pAv').textContent    = name[0].toUpperCase();
+  document.getElementById('pName').textContent  = name;
+  document.getElementById('pEmail').textContent = user.email;
+  if (isMod(user.email)) {
+    document.getElementById('pBadge').innerHTML = '<span class="mod-badge">⭐ Преподаватель</span>';
+    document.getElementById('modBtn').style.display = 'inline-block';
+  } else {
+    document.getElementById('pBadge').innerHTML = '<span class="stu-badge">👤 Ученик</span>';
+  }
+  loadHw();
+  loadSubs();
+  setChatInfo();
+}
+
+// ── ПРЕДМЕТ ──
+function setSub(subj, btn) {
+  curSubj = subj;
+  document.querySelectorAll('.stab').forEach(function(b){ b.classList.remove('on'); });
+  btn.classList.add('on');
+  loadHw();
+  loadSubs();
+  setChatInfo();
+}
+
+// ── ВКЛАДКИ ──
+function setTab(id, btn) {
+  document.querySelectorAll('.tcontent').forEach(function(c){ c.classList.remove('on'); });
+  document.querySelectorAll('.mtab').forEach(function(b){ b.classList.remove('on'); });
+  document.getElementById('tab-' + id).classList.add('on');
+  if (btn) btn.classList.add('on');
+  if (id === 'chat') loadMsgs();
+  if (id === 'mod')  loadSubs2();
+}
+function setModTab(id, btn) {
+  document.querySelectorAll('.modcontent').forEach(function(c){ c.classList.remove('on'); });
+  document.querySelectorAll('.mod-tab').forEach(function(b){ b.classList.remove('on'); });
+  document.getElementById('mod-' + id).classList.add('on');
+  if (btn) btn.classList.add('on');
+  if (id === 'check')    loadSubs2();
+  if (id === 'mytasks')  loadMyTasks();
+}
+
+// ── ДЗ ──
+async function loadHw() {
+  var el = document.getElementById('hwList');
+  if (!me) return;
+  var result = await supabase.from('homework').select('*').eq('subject', curSubj).order('created_at', { ascending: false });
+  var color = curSubj === 'math' ? 'rgba(0,212,255,.1)' : 'rgba(255,170,0,.1)';
+  if (result.error || !result.data || !result.data.length) {
+    el.innerHTML = curSubj === 'math'
+      ? '<div class="hw-c"><div class="hw-ico" style="background:rgba(0,212,255,.1)">📐</div><div class="hw-body"><div class="hw-t">Уравнения — вариант №3</div><div class="hw-m">Срок: завтра</div></div><span class="hw-st st-n">Новое</span></div>'
+      : '<div class="hw-c"><div class="hw-ico" style="background:rgba(255,170,0,.1)">🖊️</div><div class="hw-body"><div class="hw-t">Эссе: Демократия</div><div class="hw-m">150–200 слов · Срок: пятница</div></div><span class="hw-st st-n">Новое</span></div>';
+    return;
+  }
+  el.innerHTML = result.data.map(function(h) {
+    var dl = h.deadline ? new Date(h.deadline).toLocaleString('ru-RU', {day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}) : '';
+    return '<div class="hw-c"><div class="hw-ico" style="background:' + color + '">📝</div><div class="hw-body"><div class="hw-t">' + h.title + '</div><div class="hw-m">' + (h.description || '') + (dl ? ' · ' + dl : '') + '</div></div><span class="hw-st st-n">Новое</span></div>';
+  }).join('');
+}
+
+// ── МОИ РАБОТЫ ──
+async function loadSubs() {
+  var el = document.getElementById('mySubs');
+  if (!me) return;
+  var result = await supabase.from('submissions').select('*').eq('user_id', me.id).eq('subject', curSubj).order('created_at', { ascending: false }).limit(10);
+  document.getElementById('stSubs').textContent = result.data ? result.data.filter(function(s){ return !s.checked; }).length : 0;
+  document.getElementById('stSolved').textContent = result.data ? result.data.length : 0;
+  if (!result.data || !result.data.length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:13px;">Нет отправленных работ</div>';
+    return;
+  }
+  el.innerHTML = result.data.map(function(s) {
+    return '<div class="sub-card"><div class="sub-meta">📝 ' + (s.task_num || 'Задание') + '</div><div class="sub-text">' + s.answer + '</div>' +
+      (s.comment ? '<div class="sub-comment">💬 ' + s.comment + '</div>' : '<div style="font-size:11px;color:var(--muted);">⏳ Ожидает проверки</div>') +
+      '</div>';
+  }).join('');
+}
+
+// ── ЧАТ ──
+function setChatInfo() {
+  var info = curSubj === 'math'
+    ? { name: 'Алексей Пястолов', role: 'Математика', av: 'АП', bg: 'linear-gradient(135deg,var(--math),#0088cc)' }
+    : { name: 'Дмитрий Максимов', role: 'Обществознание', av: 'ДМ', bg: 'linear-gradient(135deg,var(--soc),#cc7700)' };
+  document.getElementById('chatAv').textContent         = info.av;
+  document.getElementById('chatAv').style.background    = info.bg;
+  document.getElementById('chatName').textContent       = info.name;
+  document.getElementById('chatRole').textContent       = info.role;
+}
+async function loadMsgs() {
+  if (!me) return;
+  var el = document.getElementById('chatMsgs');
+  var result = await supabase.from('messages').select('*')
+    .or('from_id.eq.' + me.id + ',to_id.eq.' + me.id)
+    .order('created_at', { ascending: true }).limit(60);
+  if (!result.data || !result.data.length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:13px;text-align:center;padding:20px;">Напишите первое сообщение тренеру 👋</div>';
+    return;
+  }
+  el.innerHTML = result.data.map(function(m) {
+    var isMe = m.from_id === me.id;
+    var time = new Date(m.created_at).toLocaleTimeString('ru-RU', {hour:'2-digit',minute:'2-digit'});
+    return '<div class="msg ' + (isMe ? 'me' : 'them') + '">' + m.body + '<div class="msg-time">' + time + '</div></div>';
+  }).join('');
+  el.scrollTop = el.scrollHeight;
+}
+async function sendMsg() {
+  if (!me) return;
+  var inp = document.getElementById('chatInp');
+  var body = inp.value.trim();
+  if (!body) return;
+  inp.value = '';
+  await supabase.from('messages').insert({ from_id: me.id, from_name: (me.user_metadata && me.user_metadata.name) || me.email, body: body, to_id: me.id });
+  loadMsgs();
+}
+// Enter в чате
+document.addEventListener('DOMContentLoaded', function() {
+  document.getElementById('chatInp').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') sendMsg();
+  });
+  document.getElementById('lPass').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') doLogin();
+  });
+  document.getElementById('rPass').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') doReg();
+  });
+});
+
+// ── ТИП ЗАДАНИЯ ──
+function setTaskType(t) {
+  taskType = t;
+  document.getElementById('ttest').classList.toggle('on', t === 'test');
+  document.getElementById('text').classList.toggle('on',  t === 'extended');
+  document.getElementById('optSec').style.display = t === 'test' ? 'block' : 'none';
+  document.getElementById('extSec').style.display = t === 'extended' ? 'block' : 'none';
+}
+function addOpt() {
+  var d = document.createElement('div');
+  d.className = 'opt-row';
+  d.innerHTML = '<input class="finput" placeholder="Вариант..."><button class="rm-opt" onclick="rmOpt(this)">✕</button>';
+  document.getElementById('optBuilder').appendChild(d);
+}
+function rmOpt(btn) {
+  if (document.querySelectorAll('#optBuilder .opt-row').length > 2) btn.parentElement.remove();
+}
+
+// ── ЗАГРУЗИТЬ ЗАДАНИЕ ──
+async function uploadTask() {
+  if (!me) return;
+  var q     = document.getElementById('uQ').value.trim();
+  var topic = document.getElementById('uTopic').value.trim();
+  if (!q || !topic) return toast('Заполните тему и текст задания', 'err');
+  var answer  = '';
+  var options = [];
+  if (taskType === 'test') {
+    options = Array.from(document.querySelectorAll('#optBuilder input')).map(function(i){ return i.value.trim(); }).filter(Boolean);
+    answer  = document.getElementById('uAns').value.trim();
+    if (options.length < 2 || !answer) return toast('Добавьте варианты и правильный ответ', 'err');
+  } else {
+    answer = document.getElementById('uAnsExt').value.trim();
+  }
+  var result = await supabase.from('tasks').insert({
+    subject:     document.getElementById('uSubj').value,
+    topic:       topic,
+    num:         document.getElementById('uNum').value.trim() || 'Задание',
+    diff:        document.getElementById('uDiff').value,
+    question:    q,
+    type:        taskType,
+    options:     taskType === 'test' ? options : [],
+    answer:      answer,
+    explain:     document.getElementById('uExpl').value.trim(),
+    author_id:   me.id,
+    author_name: (me.user_metadata && me.user_metadata.name) || me.email,
+  });
+  if (result.error) return toast('Ошибка: ' + result.error.message, 'err');
+  toast('✓ Задание опубликовано!', 'ok');
+  ['uTopic','uNum','uQ','uAns','uAnsExt','uExpl'].forEach(function(id){
+    var el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  loadMyTasks();
+}
+
+// ── ПРОВЕРКА РАБОТ ──
+async function loadSubs2() {
+  var el = document.getElementById('subsList');
+  if (!el) return;
+  var result = await supabase.from('submissions').select('*').eq('checked', false).order('created_at', { ascending: false });
+  if (!result.data || !result.data.length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:13px;">Нет работ на проверке 🎉</div>';
+    return;
+  }
+  el.innerHTML = result.data.map(function(s) {
+    return '<div class="check-card"><div class="sub-meta">👤 ' + (s.user_name || 'Ученик') + ' · 📝 ' + (s.task_num || 'Задание') + ' · ' + (s.subject === 'math' ? 'Математика' : 'Обществознание') + '</div>' +
+      '<div class="sub-text">' + s.answer + '</div>' +
+      '<div class="comment-row"><input class="comment-inp" id="ci_' + s.id + '" placeholder="Комментарий..."><button class="comment-ok" onclick="sendComment(\'' + s.id + '\')">Отправить</button></div></div>';
+  }).join('');
+}
+async function sendComment(id) {
+  var t = document.getElementById('ci_' + id);
+  if (!t || !t.value.trim()) return;
+  await supabase.from('submissions').update({ comment: t.value.trim(), checked: true }).eq('id', id);
+  toast('✓ Комментарий отправлен', 'ok');
+  loadSubs2();
+}
+
+// ── ОТПРАВИТЬ ДЗ ──
+async function sendHw() {
+  var title = document.getElementById('hwTitle').value.trim();
+  if (!title) return toast('Введите название ДЗ', 'err');
+  var result = await supabase.from('homework').insert({
+    subject:     document.getElementById('hwSubj').value,
+    title:       title,
+    description: document.getElementById('hwDesc').value.trim(),
+    deadline:    document.getElementById('hwDl').value || null,
+    author_id:   me.id,
+    author_name: (me.user_metadata && me.user_metadata.name) || me.email,
+  });
+  if (result.error) return toast('Ошибка: ' + result.error.message, 'err');
+  toast('✓ ДЗ отправлено!', 'ok');
+  ['hwTitle','hwDesc','hwDl'].forEach(function(id){ document.getElementById(id).value = ''; });
+}
+
+// ── МОИ ЗАДАНИЯ ──
+async function loadMyTasks() {
+  var el = document.getElementById('myTasksList');
+  if (!me) return;
+  var result = await supabase.from('tasks').select('*').eq('author_id', me.id).order('created_at', { ascending: false });
+  if (!result.data || !result.data.length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:13px;">Вы ещё не загружали задания</div>';
+    return;
+  }
+  el.innerHTML = result.data.map(function(t) {
+    return '<div class="check-card" style="display:flex;justify-content:space-between;align-items:center;">' +
+      '<div><div style="font-size:13px;font-weight:600;color:var(--text)">' + t.num + ' — ' + t.topic + '</div>' +
+      '<div style="font-size:11px;color:var(--muted);margin-top:2px;">' + (t.type === 'test' ? 'Тест' : 'Развёрнутый') + ' · ' + (t.subject === 'math' ? 'Мат.' : 'Общ.') + '</div></div>' +
+      '<button onclick="delTask(\'' + t.id + '\')" style="padding:6px 12px;border-radius:8px;background:rgba(255,51,119,.08);border:1px solid rgba(255,51,119,.2);color:var(--pink);font-size:11px;cursor:pointer;">Удалить</button></div>';
+  }).join('');
+}
+async function delTask(id) {
+  if (!confirm('Удалить задание?')) return;
+  await supabase.from('tasks').delete().eq('id', id);
+  toast('Удалено', 'ok');
+  loadMyTasks();
+}
+
+// ── ИНИЦИАЛИЗАЦИЯ: ПРОВЕРИТЬ AUTH ──
+(async function init() {
+  var result = await supabase.auth.getSession();
+  if (result.data && result.data.session) {
+    await showCab(result.data.session.user);
+  }
+  supabase.auth.onAuthStateChange(async function(event, session) {
+    if (session) {
+      await showCab(session.user);
+    }
+  });
+})();
+</script>
+</body>
+</html>

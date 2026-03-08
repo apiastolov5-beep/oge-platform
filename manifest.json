@@ -1,0 +1,23 @@
+{
+  "name": "ОГЭ Платформа — Пястолов & Максимов",
+  "short_name": "ОГЭ 2025",
+  "description": "Подготовка к ОГЭ по математике и обществознанию",
+  "start_url": "/index.html",
+  "display": "standalone",
+  "background_color": "#080810",
+  "theme_color": "#080810",
+  "orientation": "portrait-primary",
+  "lang": "ru",
+  "icons": [
+    { "src": "icon-96.png",  "sizes": "96x96",   "type": "image/png", "purpose": "any" },
+    { "src": "icon-180.png", "sizes": "180x180",  "type": "image/png", "purpose": "any" },
+    { "src": "icon-192.png", "sizes": "192x192",  "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512",  "type": "image/png", "purpose": "any maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Математика",      "url": "/math.html",    "icons": [{"src":"icon-96.png","sizes":"96x96"}] },
+    { "name": "Обществознание",  "url": "/social.html",  "icons": [{"src":"icon-96.png","sizes":"96x96"}] },
+    { "name": "Личный кабинет",  "url": "/cabinet.html", "icons": [{"src":"icon-96.png","sizes":"96x96"}] }
+  ],
+  "categories": ["education"]
+}
